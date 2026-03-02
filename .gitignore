@@ -1,0 +1,4 @@
+bridge/.venv/
+bridge/__pycache__/
+*.pyc
+.env
