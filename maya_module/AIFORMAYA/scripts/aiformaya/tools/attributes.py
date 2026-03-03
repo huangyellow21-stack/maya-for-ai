@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 
+try:
+    basestring
+except NameError:
+    basestring = str
+
 
 GROUP_MAP = {
     "translate": ["tx", "ty", "tz"],

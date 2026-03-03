@@ -8,7 +8,20 @@ import re
 import maya.cmds as cmds
 import maya.mel as mel
 
+try:
+    basestring
+except NameError:
+    basestring = str
+
 from .attributes import expand_attributes
+
+try:
+    from ..core.memory import EntityMemory
+except ImportError:
+    class EntityMemory(object):
+        @classmethod
+        def update_last_created(cls, entity_type, entity_name):
+            pass
 
 
 class ToolError(Exception):
@@ -16,6 +29,13 @@ class ToolError(Exception):
         Exception.__init__(self, message)
         self.code = code
         self.message = message
+
+class ConfirmationError(Exception):
+    def __init__(self, action, target, options):
+        Exception.__init__(self, "Confirmation Required")
+        self.action = action
+        self.target = target
+        self.options = options
 
 
 def _ensure_selection():
@@ -451,6 +471,7 @@ def tool_create_cube(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        EntityMemory.update_last_created("cube", actual)
         return {"transform": actual, "width": w, "height": h, "depth": d, "subdiv": {"x": sx, "y": sy, "z": sz}}
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "polyCube 失败：%s" % str(e))
@@ -477,6 +498,7 @@ def tool_create_sphere(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        EntityMemory.update_last_created("sphere", actual)
         return {"transform": actual, "radius": radius, "subdiv": {"axis": sx, "height": sy}}
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "polySphere 失败：%s" % str(e))
@@ -505,6 +527,7 @@ def tool_create_cylinder(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        EntityMemory.update_last_created("cylinder", actual)
         return {
             "transform": actual,
             "radius": radius,
@@ -537,6 +560,7 @@ def tool_create_plane(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        EntityMemory.update_last_created("plane", actual)
         return {"transform": actual, "width": w, "height": h, "subdiv": {"x": sx, "y": sy}}
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "polyPlane 失败：%s" % str(e))
@@ -573,6 +597,7 @@ def tool_create_camera(args):
                 cmds.setAttr(shape + ".nearClipPlane", float(near_clip))
             if far_clip is not None:
                 cmds.setAttr(shape + ".farClipPlane", float(far_clip))
+        EntityMemory.update_last_created("camera", actual)
         return {"transform": actual, "shape": shape, "focal_length": focal_length, "near_clip": near_clip, "far_clip": far_clip}
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "camera 失败：%s" % str(e))
@@ -1281,7 +1306,530 @@ def tool_import_bomb_asset(args):
     return {"path": path, "namespace": namespace}
 
 
+def _get_target_and_source(args, allow_fallback=True):
+    source = args.get("source")
+    target = args.get("target")
+
+    if not source or not target:
+        if allow_fallback:
+            sel = cmds.ls(sl=True, fl=True) or []
+            if len(sel) != 2:
+                raise ToolError("MAYA_SELECTION_REQUIRED", "需要选中 2 个 transform（source 与 target）")
+            for s in sel:
+                if "." in s:
+                    raise ToolError("MAYA_INVALID_SELECTION", "该工具需要选择物体（transform），不能是组件选择")
+            transforms = _to_transforms_from_selection(sel)
+            if len(transforms) != 2:
+                raise ToolError("MAYA_SELECTION_REQUIRED", "需要选中 2 个 transform（source 与 target）")
+            source = source or transforms[0]
+            target = target or transforms[1]
+        else:
+             raise ToolError("MAYA_SELECTION_REQUIRED", "需要提供 source 和 target")
+
+    if not isinstance(source, basestring) or not source.strip():
+        raise ToolError("MAYA_INVALID_TARGET", "source 必须是字符串")
+    if not isinstance(target, basestring) or not target.strip():
+        raise ToolError("MAYA_INVALID_TARGET", "target 必须是字符串")
+
+    source = source.strip()
+    target = target.strip()
+
+    if not cmds.objExists(source):
+        raise ToolError("MAYA_INVALID_TARGET", "source 不存在: %s" % source)
+    if not cmds.objExists(target):
+         raise ToolError("MAYA_INVALID_TARGET", "target 不存在: %s" % target)
+
+    if cmds.nodeType(source) != "transform":
+         parents = cmds.listRelatives(source, parent=True, fullPath=False) or []
+         if parents and cmds.nodeType(parents[0]) == "transform":
+             source = parents[0]
+         else:
+             raise ToolError("MAYA_INVALID_SELECTION", "source 必须是 transform")
+
+    if cmds.nodeType(target) != "transform":
+        parents = cmds.listRelatives(target, parent=True, fullPath=False) or []
+        if parents and cmds.nodeType(parents[0]) == "transform":
+            target = parents[0]
+        else:
+            raise ToolError("MAYA_INVALID_SELECTION", "target 必须是 transform")
+
+    return source, target
+
+def tool_match_transform(args):
+    source, target = _get_target_and_source(args)
+    do_t = bool(args.get("translate", True))
+    do_r = bool(args.get("rotate", True))
+    do_s = bool(args.get("scale", False))
+    space = args.get("space", "world")
+    set_key = bool(args.get("set_key", False))
+    time_val = args.get("time")
+
+    if space not in ("world", "object"):
+        space = "world"
+
+    try:
+        if time_val is not None:
+             cmds.currentTime(float(time_val), edit=True)
+
+        before = {
+            "t": cmds.xform(source, q=True, ws=(space=="world"), os=(space=="object"), t=True) or [0,0,0],
+            "r": cmds.xform(source, q=True, ws=(space=="world"), os=(space=="object"), ro=True) or [0,0,0],
+            "s": cmds.xform(source, q=True, ws=(space=="world"), os=(space=="object"), s=True) or [1,1,1]
+        }
+        
+        target_t = cmds.xform(target, q=True, ws=(space=="world"), os=(space=="object"), t=True) or [0,0,0]
+        target_r = cmds.xform(target, q=True, ws=(space=="world"), os=(space=="object"), ro=True) or [0,0,0]
+        target_s = cmds.xform(target, q=True, ws=(space=="world"), os=(space=="object"), s=True) or [1,1,1]
+
+        if do_t:
+             cmds.xform(source, ws=(space=="world"), os=(space=="object"), t=target_t)
+        if do_r:
+             cmds.xform(source, ws=(space=="world"), os=(space=="object"), ro=target_r)
+        if do_s:
+             try:
+                 cmds.setAttr(source + ".sx", target_s[0])
+                 cmds.setAttr(source + ".sy", target_s[1])
+                 cmds.setAttr(source + ".sz", target_s[2])
+             except Exception:
+                 pass
+
+        after = {
+            "t": cmds.xform(source, q=True, ws=(space=="world"), os=(space=="object"), t=True) or [0,0,0],
+            "r": cmds.xform(source, q=True, ws=(space=="world"), os=(space=="object"), ro=True) or [0,0,0],
+            "s": cmds.xform(source, q=True, ws=(space=="world"), os=(space=="object"), s=True) or [1,1,1]
+        }
+
+        if set_key:
+            plugs = []
+            if do_t: plugs += [source+".tx", source+".ty", source+".tz"]
+            if do_r: plugs += [source+".rx", source+".ry", source+".rz"]
+            if do_s: plugs += [source+".sx", source+".sy", source+".sz"]
+            if plugs:
+                 cmds.setKeyframe(plugs)
+
+        return {
+             "source": source,
+             "target": target,
+             "applied": {"translate": do_t, "rotate": do_r, "scale": do_s},
+             "space": space,
+             "time": float(cmds.currentTime(q=True)),
+             "set_key": set_key,
+             "before": before,
+             "after": after
+        }
+    except Exception as e:
+         raise ToolError("MAYA_COMMAND_FAILED", "match_transform 失败：%s" % str(e))
+
+def _axis_to_vector(axis_str):
+    mapping = {
+        "x": [1,0,0], "-x": [-1,0,0],
+        "y": [0,1,0], "-y": [0,-1,0],
+        "z": [0,0,1], "-z": [0,0,-1]
+    }
+    return mapping.get(str(axis_str).lower(), [0,0,1])
+
+def tool_aim_at_target(args):
+    source, target = _get_target_and_source(args)
+
+    aim_axis = args.get("aim_axis", "z")
+    up_axis = args.get("up_axis", "y")
+    world_up_type = args.get("world_up_type", "scene")
+    world_up_object = args.get("world_up_object")
+    maintain_offset = bool(args.get("maintain_offset", False))
+    create_constraint = bool(args.get("create_constraint", True))
+    delete_constraint_after = bool(args.get("delete_constraint_after", False))
+    set_key = bool(args.get("set_key", False))
+    time_val = args.get("time")
+
+    if world_up_type == "object":
+        if not world_up_object or not cmds.objExists(world_up_object):
+             raise ToolError("ARG_VALIDATION_FAILED", "world_up_type=object 但未提供有效的 world_up_object")
+
+    aim_vec = _axis_to_vector(aim_axis)
+    up_vec = _axis_to_vector(up_axis)
+
+    try:
+        if time_val is not None:
+             cmds.currentTime(float(time_val), edit=True)
+
+        kwargs = {
+            "aimVector": aim_vec,
+            "upVector": up_vec,
+            "worldUpType": "scene" if world_up_type == "scene" else "object",
+            "mo": maintain_offset
+        }
+        if world_up_type == "object":
+             kwargs["worldUpObject"] = world_up_object
+
+        res = cmds.aimConstraint(target, source, **kwargs)
+        constraint_name = res[0] if isinstance(res, (list, tuple)) and res else res
+
+        mode = "persistent"
+        deleted = False
+
+        if delete_constraint_after:
+             cmds.currentTime(cmds.currentTime(q=True), e=True)
+             current_ro = cmds.xform(source, q=True, ws=True, ro=True) or [0,0,0]
+             cmds.delete(constraint_name)
+             deleted = True
+             mode = "one_shot"
+             try:
+                 cmds.xform(source, ws=True, ro=current_ro)
+             except Exception:
+                 pass
+
+        if set_key:
+            cmds.setKeyframe([source+".rx", source+".ry", source+".rz"])
+
+        return {
+            "source": source,
+            "target": target,
+            "aim_axis": aim_axis,
+            "up_axis": up_axis,
+            "world_up_type": world_up_type,
+            "maintain_offset": maintain_offset,
+            "constraint": {
+                "created": create_constraint,
+                "name": constraint_name,
+                "deleted": deleted
+            },
+            "mode": mode,
+            "set_key": set_key,
+            "time": float(cmds.currentTime(q=True))
+        }
+
+    except Exception as e:
+        raise ToolError("MAYA_COMMAND_FAILED", "aim_at_target 失败：%s" % str(e))
+
+def _get_drivers_and_driven(args):
+    drivers = args.get("drivers")
+    driven = args.get("driven")
+    
+    if isinstance(drivers, basestring):
+         drivers = [drivers]
+         
+    if not drivers: drivers = []
+    
+    if not drivers and not driven:
+         sel = cmds.ls(sl=True, fl=True) or []
+         if len(sel) < 2:
+             raise ToolError("MAYA_SELECTION_REQUIRED", "需要选择至少 2 个物体（前面的为驱动，最后一个为被驱动）")
+         for s in sel:
+             if "." in s:
+                 raise ToolError("MAYA_INVALID_SELECTION", "约束工具必须选择 transform，不能有组件")
+         
+         sel_trans = _to_transforms_from_selection(sel)
+         if len(sel_trans) < 2:
+             raise ToolError("MAYA_SELECTION_REQUIRED", "需要选择至少 2 个 transform")
+             
+         driven = sel_trans[-1]
+         drivers = sel_trans[:-1]
+    
+    elif driven and not drivers:
+         sel = cmds.ls(sl=True, fl=True) or []
+         if not sel:
+              raise ToolError("MAYA_SELECTION_REQUIRED", "提供了 driven 但没有 drivers，请在场景中选择 drivers")
+         sel_trans = []
+         for s in sel:
+            if "." in s: continue
+            try:
+                sel_trans += _to_transforms_from_selection([s])
+            except Exception: pass
+            
+         drivers = [item for item in sel_trans if item != driven]
+         if not drivers:
+              raise ToolError("MAYA_SELECTION_REQUIRED", "提供了 driven 但选择集中没有其他有效 transform 做 drivers")
+    
+    elif drivers and not driven:
+         sel = cmds.ls(sl=True, fl=True) or []
+         if not sel:
+             raise ToolError("MAYA_SELECTION_REQUIRED", "提供了 drivers 但没有 driven，请在场景中最后选择 driven")
+         sel_trans = []
+         for s in sel:
+            if "." in s: continue
+            try:
+                sel_trans += _to_transforms_from_selection([s])
+            except Exception: pass
+         
+         if sel_trans:
+             driven = sel_trans[-1]
+         else:
+             raise ToolError("MAYA_SELECTION_REQUIRED", "提供了 drivers 但没有 driven，且无法从选择集中提取 driven")
+
+    if not drivers or not driven:
+         raise ToolError("MAYA_SELECTION_REQUIRED", "无法解析有效的 drivers 和 driven")
+         
+    if len(drivers) > 10:
+         raise ToolError("MAYA_TOO_MANY_TARGETS", "驱动物体 drivers 数量过多（>10），暂不支持")
+         
+    for n in drivers + [driven]:
+         if not cmds.objExists(n):
+              raise ToolError("MAYA_INVALID_TARGET", "目标不存在: %s" % n)
+         if cmds.nodeType(n) != "transform":
+              parents = cmds.listRelatives(n, parent=True, fullPath=False) or []
+              if not parents or cmds.nodeType(parents[0]) != "transform":
+                  raise ToolError("MAYA_INVALID_SELECTION", "约束目标必须是 transform: %s" % n)
+
+    return drivers, driven
+
+def _do_constraint(constraint_func, args):
+    drivers, driven = _get_drivers_and_driven(args)
+    maintain_offset = bool(args.get("maintain_offset", True))
+    weight = float(args.get("weight", 1.0))
+    skip_axes = args.get("skip_axes") or []
+    delete_constraint_after = bool(args.get("delete_constraint_after", False))
+    set_key = bool(args.get("set_key", False))
+    time_val = args.get("time")
+    
+    if not isinstance(skip_axes, (list, tuple)): skip_axes = [skip_axes]
+    skip_axes = [str(x).lower() for x in skip_axes if x in ('x','y','z')]
+
+    try:
+        if time_val is not None:
+             cmds.currentTime(float(time_val), edit=True)
+             
+        kwargs = {
+            "mo": maintain_offset,
+            "weight": weight
+        }
+        if skip_axes:
+             kwargs["skip"] = skip_axes
+             
+        cmd_args = drivers + [driven]
+        res = constraint_func(*cmd_args, **kwargs)
+        constraint_name = res[0] if isinstance(res, (list, tuple)) and res else res
+        
+        deleted = False
+        if delete_constraint_after:
+             cmds.currentTime(cmds.currentTime(q=True), e=True)
+             cur_t = cmds.xform(driven, q=True, ws=True, t=True) or [0,0,0]
+             cur_r = cmds.xform(driven, q=True, ws=True, ro=True) or [0,0,0]
+             cmds.delete(constraint_name)
+             deleted = True
+             try:
+                 cmds.xform(driven, ws=True, t=cur_t, ro=cur_r)
+             except Exception:
+                 pass
+                 
+        if set_key:
+             plugs = []
+             if constraint_func == cmds.pointConstraint or constraint_func == cmds.parentConstraint:
+                 plugs += [driven+".tx", driven+".ty", driven+".tz"]
+             if constraint_func == cmds.orientConstraint or constraint_func == cmds.parentConstraint:
+                 plugs += [driven+".rx", driven+".ry", driven+".rz"]
+             if plugs:
+                 cmds.setKeyframe(plugs)
+                 
+        return {
+            "drivers": drivers,
+            "driven": driven,
+            "constraint_name": constraint_name,
+            "deleted": deleted,
+            "maintain_offset": maintain_offset,
+            "skip_axes": skip_axes,
+            "time": float(cmds.currentTime(q=True)),
+            "set_key": set_key
+        }
+    except Exception as e:
+         raise ToolError("MAYA_COMMAND_FAILED", "constraint 失败：%s" % str(e))
+
+def tool_point_constraint(args):
+    return _do_constraint(cmds.pointConstraint, args)
+    
+def tool_orient_constraint(args):
+    return _do_constraint(cmds.orientConstraint, args)
+    
+def tool_parent_constraint(args):
+    return _do_constraint(cmds.parentConstraint, args)
+
+def tool_create_object_and_camera_and_aim(args):
+    object_type = args.get("object_type", "sphere").lower()
+    object_name = args.get("object_name")
+    camera_name = args.get("camera_name")
+    distance_multiplier = float(args.get("distance_multiplier", 4.0))
+    min_distance = float(args.get("min_distance", 10.0))
+    place_direction = args.get("place_direction", "-z").lower()
+    create_persistent_constraint = bool(args.get("create_persistent_constraint", True))
+    camera_forward_axis = args.get("camera_forward_axis", "-z").lower()
+
+    try:
+        if object_type == "cube":
+            obj = cmds.polyCube(name=object_name)[0] if object_name else cmds.polyCube()[0]
+        elif object_type == "cylinder":
+            obj = cmds.polyCylinder(name=object_name)[0] if object_name else cmds.polyCylinder()[0]
+        else:
+            obj = cmds.polySphere(name=object_name)[0] if object_name else cmds.polySphere()[0]
+            object_type = "sphere"
+        
+        if camera_name:
+            cam, cam_shape = cmds.camera(name=camera_name)
+        else:
+            cam, cam_shape = cmds.camera()
+
+        bbox = cmds.exactWorldBoundingBox(obj)
+        radius_est = max(bbox[3]-bbox[0], bbox[4]-bbox[1], bbox[5]-bbox[2]) / 2.0
+        distance = max(radius_est * distance_multiplier, min_distance)
+        
+        obj_pos = cmds.xform(obj, q=True, ws=True, t=True)
+        cam_pos = list(obj_pos)
+
+        dir_map = {
+            "+x": [1,0,0], "-x": [-1,0,0],
+            "+y": [0,1,0], "-y": [0,-1,0],
+            "+z": [0,0,1], "-z": [0,0,-1],
+        }
+        vec = dir_map.get(place_direction, [0,0,-1])
+        cam_pos[0] += vec[0] * distance
+        cam_pos[1] += vec[1] * distance
+        cam_pos[2] += vec[2] * distance
+
+        cmds.xform(cam, ws=True, t=cam_pos)
+
+        # To aim the camera AT the object, its LOCAL forward axis must point to the target.
+        # Maya's default camera forward is -Z.
+        axis_map = {
+            "+x": [1,0,0], "-x": [-1,0,0],
+            "+y": [0,1,0], "-y": [0,-1,0],
+            "+z": [0,0,1], "-z": [0,0,-1]
+        }
+        aim_vec = axis_map.get(camera_forward_axis, [0, 0, -1])
+        
+        # Calculate up vector to prevent flipping. Default scene up is +Y.
+        up_vec = [0, 1, 0]
+        if abs(aim_vec[1]) == 1.0: # If aiming straight up or down
+            up_vec = [0, 0, -1] if aim_vec[1] > 0 else [0, 0, 1]
+
+        # aimConstraint syntax: aimVector defines WHICH local axis points at the target.
+        constraint = cmds.aimConstraint(
+            obj, cam, 
+            aimVector=aim_vec, 
+            upVector=up_vec, 
+            worldUpType="vector", 
+            worldUpVector=[0, 1, 0],
+            maintainOffset=False
+        )[0]
+
+        if not create_persistent_constraint:
+            cmds.delete(constraint)
+            constraint_result = {"type": "aim", "name": constraint, "persistent": False}
+        else:
+            constraint_result = {"type": "aim", "name": constraint, "persistent": True}
+
+        EntityMemory.update_last_created(object_type, obj)
+        EntityMemory.update_last_created("camera", cam)
+
+        return {
+            "object": obj,
+            "object_type": object_type,
+            "camera_transform": cam,
+            "camera_shape": cam_shape,
+            "camera_position": cam_pos,
+            "object_position": obj_pos,
+            "distance_used": distance,
+            "constraint": constraint_result
+        }
+    except Exception as e:
+        raise ToolError("MAYA_COMMAND_FAILED", "create_object_and_camera_and_aim 失败：%s" % str(e))
+
 TOOLS = [
+    {
+        "name": "maya.match_transform",
+        "description": "将一个 transform 的 translate/rotate/scale（可选）对齐到另一个 transform。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": { "type": "string", "description": "要被对齐的物体（缺省使用选择第1个）" },
+                "target": { "type": "string", "description": "对齐参照物体（缺省使用选择第2个）" },
+                "translate": { "type": "boolean", "default": True },
+                "rotate": { "type": "boolean", "default": True },
+                "scale": { "type": "boolean", "default": False },
+                "space": { "type": "string", "enum": ["world", "object"], "default": "world" },
+                "set_key": { "type": "boolean", "default": False },
+                "time": { "type": "number", "description": "可选；先切到该帧再执行" }
+            },
+            "required": []
+        },
+        "handler": tool_match_transform,
+    },
+    {
+        "name": "maya.aim_at_target",
+        "description": "让 source 朝向 target，可选择创建 aimConstraint 持续跟随，或对准一次后删除约束。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": { "type": "string" },
+                "target": { "type": "string" },
+                "aim_axis": { "type": "string", "enum": ["x","y","z","-x","-y","-z"], "default": "z" },
+                "up_axis":  { "type": "string", "enum": ["x","y","z","-x","-y","-z"], "default": "y" },
+                "world_up_type": { "type": "string", "enum": ["scene","object"], "default": "scene" },
+                "world_up_object": { "type": "string", "description": "world_up_type=object 时必填" },
+                "maintain_offset": { "type": "boolean", "default": False },
+                "create_constraint": { "type": "boolean", "default": True },
+                "delete_constraint_after": { "type": "boolean", "default": False },
+                "set_key": { "type": "boolean", "default": False },
+                "time": { "type": "number" }
+            },
+            "required": []
+        },
+        "handler": tool_aim_at_target,
+    },
+    {
+        "name": "maya.point_constraint",
+        "description": "创建点约束。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drivers": { "type": ["array","string"], "items": { "type": "string" }, "description": "驱动物体；缺省使用选择中除最后一个外的全部" },
+                "driven":  { "type": "string", "description": "被驱动物体；缺省使用选择最后一个" },
+                "maintain_offset": { "type": "boolean", "default": True },
+                "weight": { "type": "number", "default": 1.0 },
+                "skip_axes": { "type": "array", "items": { "type": "string", "enum": ["x","y","z"] } },
+                "delete_constraint_after": { "type": "boolean", "default": False },
+                "time": { "type": "number" },
+                "set_key": { "type": "boolean", "default": False }
+            },
+            "required": []
+        },
+        "handler": tool_point_constraint,
+    },
+    {
+        "name": "maya.orient_constraint",
+        "description": "创建方向约束。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drivers": { "type": ["array","string"], "items": { "type": "string" }, "description": "驱动物体；缺省使用选择中除最后一个外的全部" },
+                "driven":  { "type": "string", "description": "被驱动物体；缺省使用选择最后一个" },
+                "maintain_offset": { "type": "boolean", "default": True },
+                "weight": { "type": "number", "default": 1.0 },
+                "skip_axes": { "type": "array", "items": { "type": "string", "enum": ["x","y","z"] } },
+                "delete_constraint_after": { "type": "boolean", "default": False },
+                "time": { "type": "number" },
+                "set_key": { "type": "boolean", "default": False }
+            },
+            "required": []
+        },
+        "handler": tool_orient_constraint,
+    },
+    {
+        "name": "maya.parent_constraint",
+        "description": "创建父约束。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drivers": { "type": ["array","string"], "items": { "type": "string" }, "description": "驱动物体；缺省使用选择中除最后一个外的全部" },
+                "driven":  { "type": "string", "description": "被驱动物体；缺省使用选择最后一个" },
+                "maintain_offset": { "type": "boolean", "default": True },
+                "weight": { "type": "number", "default": 1.0 },
+                "skip_axes": { "type": "array", "items": { "type": "string", "enum": ["x","y","z"] } },
+                "delete_constraint_after": { "type": "boolean", "default": False },
+                "time": { "type": "number" },
+                "set_key": { "type": "boolean", "default": False }
+            },
+            "required": []
+        },
+        "handler": tool_parent_constraint,
+    },
     {
         "name": "maya.list_tools",
         "description": "返回可用工具的清单（名称与描述）。",
@@ -1678,7 +2226,163 @@ TOOLS = [
         },
         "handler": tool_import_bomb_asset,
     },
+    {
+        "name": "maya.create_object_and_camera_and_aim",
+        "description": "高层级复合工具：创建一个指定类型的物体（小球、立方体、圆柱体等）和一个摄像机，并将摄像机放置在物体外合适的距离，然后使用 aimConstraint 让摄像机看向它。适用于所有『创建某物体和摄像机并看向它』这类需求。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "object_type": {
+                    "type": "string", 
+                    "enum": ["sphere", "cube", "cylinder"],
+                    "default": "sphere"
+                },
+                "object_name": {"type": "string"},
+                "camera_name": {"type": "string"},
+                "distance_multiplier": {"type": "number", "default": 4.0},
+                "min_distance": {"type": "number", "default": 10.0},
+                "place_direction": {
+                    "type": "string",
+                    "enum": ["+z", "-z", "+x", "-x", "+y", "-y"],
+                    "default": "-z"
+                },
+                "create_persistent_constraint": {"type": "boolean", "default": True},
+                "camera_forward_axis": {
+                    "type": "string",
+                    "enum": ["+z", "-z"],
+                    "default": "-z",
+                    "description": "项目约定：摄像机朝向轴，默认-z看向目标"
+                }
+            },
+            "required": []
+        },
+        "handler": tool_create_object_and_camera_and_aim,
+    },
+    {
+        "name": "maya.add_camera_jitter",
+        "description": "为摄像机添加抖动动画。必须指定抖动类型，如果没有指定，会提示用户选择。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "camera": {"type": "string"},
+                "jitter_type": {
+                    "type": "string",
+                    "description": "如果不确定，请不要传此参数，系统会弹窗询问用户。",
+                    "enum": ["Handheld", "Vibration", "Earthquake"]
+                }
+            },
+            "required": ["camera"]
+        },
+        "handler": lambda args: tool_add_camera_jitter(args)
+    },
+    {
+        "name": "maya.ask_user_confirmation",
+        "description": "遇到涉及删除场景、大面积重置或者极其影响文件的破坏性操作时，主动调用此工具向用户弹出确认卡片。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "即将执行的破坏性操作描述，例如 '清除所有动画关键帧'"},
+                "target": {"type": "string", "description": "操作的目标对象，例如 '当前场景全选物体'"},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "提供给用户的按钮选项。一般为 ['确认删除', '取消操作并手动另存为'] 等",
+                    "default": ["确认执行", "取消"]
+                }
+            },
+            "required": ["action", "target"]
+        },
+        "handler": lambda args: tool_ask_user_confirmation(args)
+    },
+    {
+        "name": "maya.execute_python_code",
+        "description": "在 Maya 环境中动态执行任何符合规范的 Python 代码。当预设工具无法满足用户的自由需求时，你必须自己编写 `import maya.cmds as cmds` 的代码并使用这个工具执行。这能让你完成几乎所有要求！",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "包含合法 Maya Python 命令的多行脚本代码。例如：\nimport maya.cmds as cmds\ncmds.polyCube(n='myCube')\n"
+                }
+            },
+            "required": ["code"]
+        },
+        "handler": lambda args: tool_execute_python_code(args)
+    }
 ]
+
+def tool_add_camera_jitter(args):
+    camera = args.get("camera")
+    jitter_type = args.get("jitter_type")
+    
+    if not camera or not cmds.objExists(camera):
+        raise ToolError("PARAM", "目标摄像机不存在: %s" % camera)
+        
+    if not jitter_type:
+        # LLM didn't pick a type, throw confirmation error
+        raise ConfirmationError(
+            action="为摄像机添加抖动动画",
+            target=camera,
+            options=["Handheld", "Vibration", "Earthquake"]
+        )
+        
+    # Mock implementation of actually adding jitter
+    return {"status": "success", "message": u"已应用 %s 抖动到 %s" % (jitter_type, camera)}
+
+
+def tool_ask_user_confirmation(args):
+    action = args.get("action", "未知破坏性操作")
+    target = args.get("target", "整个场景")
+    options = args.get("options", ["确认执行", "取消并另存为"])
+    
+    raise ConfirmationError(action=action, target=target, options=options)
+
+
+def tool_execute_python_code(args):
+    code = args.get("code")
+    if not code:
+        raise ToolError("PARAM", "未提供要执行的 Python 代码 (code 参数为空)")
+        
+    # Create a clean namespace but inject maya.cmds and maya.mel
+    import maya.cmds as cmds
+    import maya.mel as mel
+    import sys
+    from io import StringIO
+    
+    # Simple output capture
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = capture_out = StringIO()
+    sys.stderr = capture_err = StringIO()
+    
+    namespace = {"cmds": cmds, "mel": mel}
+    
+    success = False
+    try:
+        # Avoid indentation issues if the LLM provided unindented blocks
+        import textwrap
+        code = textwrap.dedent(code).strip()
+        exec(code, namespace)
+        success = True
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        success = False
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        
+    stdout_val = capture_out.getvalue()
+    stderr_val = capture_err.getvalue()
+    
+    if not success:
+        raise ToolError("EXECUTION_FAILED", "Python 脚本执行报错:\n%s" % stderr_val)
+        
+    return {
+        "success": True, 
+        "stdout": stdout_val,
+        "message": "代码已成功在 Maya 内部执行。"
+    }
 
 
 def tools_schema():

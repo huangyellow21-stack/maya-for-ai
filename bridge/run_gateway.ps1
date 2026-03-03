@@ -27,10 +27,15 @@ if (-not $provider) {
 }
 if (-not $env:DEEPSEEK_BASE_URL -or $env:DEEPSEEK_BASE_URL -eq "") { $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com" }
 if (-not $env:GEMINI_ENDPOINT -or $env:GEMINI_ENDPOINT -eq "") { $env:GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models" }
-$port = 8765
-try {
-  $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -WarningAction SilentlyContinue
-  if ($conn.TcpTestSucceeded) { $port = 8787 }
-} catch { }
+if ($env:GATEWAY_PORT -and $env:GATEWAY_PORT -ne "") {
+    $port = [int]$env:GATEWAY_PORT
+} else {
+    $port = 8765
+}
+# Remove auto-switch port logic to avoid mismatch with client
+# try {
+#   $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -WarningAction SilentlyContinue
+#   if ($conn.TcpTestSucceeded) { $port = 8787 }
+# } catch { }
 Write-Host ("启动网关: http://127.0.0.1:{0}  | Provider: {1}" -f $port, $provider)
 & $venvPy -m uvicorn server:app --host 127.0.0.1 --port $port

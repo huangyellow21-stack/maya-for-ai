@@ -28,6 +28,8 @@ DEFAULT_CONFIG = {
     "provider": "deepseek",  # deepseek | gemini
     "model_deepseek": "deepseek-chat",
     "model_gemini": "gemini-1.5-flash",
+    "deepseek_api_key": "",
+    "gemini_api_key": "",
     "temperature": 0.2,
     "mode": "edit",
 }

@@ -26,6 +26,7 @@ class ToolSchema(BaseModel):
 
 class ChatRequest(BaseModel):
     provider: str  # "deepseek" | "gemini"
+    api_key: Optional[str] = None
     model: str
     gateway_session_id: Optional[str] = None  # 预留：后续做会话持久化
     messages: List[Dict[str, Any]]
@@ -67,35 +68,51 @@ def _build_system_message(tools: List[ToolSchema]) -> Dict[str, Any]:
     }
 
 
-_JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}\s*$", re.MULTILINE)
-
-
 def _try_parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     """
-    允许模型输出纯 JSON 或结尾带 JSON。我们取最后一个 { ... } 尝试解析。
+    允许模型输出纯 JSON 或附加在文本中。我们利用正则和括号匹配进行提取。
     """
     if not text:
         return None
-    m = _JSON_BLOCK_RE.search(text.strip())
-    if not m:
-        return None
-    candidate = m.group(0)
-    try:
-        obj = json.loads(candidate)
-    except Exception:
-        return None
-    if not isinstance(obj, dict):
-        return None
-    if obj.get("type") != "tool_call":
-        return None
-    if not isinstance(obj.get("name"), str):
-        return None
-    args = obj.get("arguments", {})
-    if args is None:
-        args = {}
-    if not isinstance(args, dict):
-        return None
-    return {"type": "tool_call", "name": obj["name"], "arguments": args}
+    import re
+    import json
+    
+    # 1. 优先提取 ```json ... ``` 块
+    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    for b in blocks:
+        try:
+            o = json.loads(b)
+            if isinstance(o, dict) and o.get("type") == "tool_call":
+                return o
+        except Exception:
+            pass
+
+    # 2. 如果没有 markdown 块，尝试全局搜索有效的 json 块
+    start_idx = text.find("{")
+    while start_idx != -1:
+        brace_count = 0
+        end_idx = -1
+        for i in range(start_idx, len(text)):
+            if text[i] == '{':
+                brace_count += 1
+            elif text[i] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    end_idx = i
+                    break
+        if end_idx != -1:
+            candidate = text[start_idx:end_idx+1]
+            try:
+                o = json.loads(candidate)
+                if isinstance(o, dict) and o.get("type") == "tool_call":
+                    return o
+            except Exception:
+                pass
+            start_idx = text.find("{", start_idx + 1)
+        else:
+            break
+
+    return None
 
 
 # -----------------------------
@@ -197,17 +214,21 @@ class GeminiRest:
 
 def _get_provider(req: ChatRequest):
     provider = req.provider.strip().lower()
+    api_key = req.api_key or ""
+    
     if provider == "deepseek":
         base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
         if not api_key:
-            raise HTTPException(status_code=400, detail="Missing env DEEPSEEK_API_KEY")
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Missing API Key (neither in request nor env)")
         return DeepSeekOpenAICompat(base_url=base_url, api_key=api_key)
 
     if provider == "gemini":
-        api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
-            raise HTTPException(status_code=400, detail="Missing env GEMINI_API_KEY")
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Missing API Key (neither in request nor env)")
         endpoint = os.environ.get("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta/models")
         return GeminiRest(api_key=api_key, endpoint=endpoint)
 
@@ -263,7 +284,7 @@ def chat(req: ChatRequest):
                 content="模型返回了不存在的工具名：%s。请重试或检查 tools 列表。原始输出：\n%s"
                 % (tool_call["name"], text),
             )
-        return ChatResponse(type="tool_call", name=tool_call["name"], arguments=tool_call["arguments"])
+        return ChatResponse(type="tool_call", name=tool_call["name"], arguments=tool_call["arguments"], content=text)
 
     return ChatResponse(type="message", content=text)
 

@@ -4,7 +4,13 @@ from __future__ import absolute_import
 import json
 
 # Maya 2020 (Py2.7) ships with urllib2
-import urllib2
+try:
+    import urllib2
+except ImportError:
+    import urllib.request as urllib2
+    import urllib.error
+    urllib2.HTTPError = urllib.error.HTTPError
+    urllib2.URLError = urllib.error.URLError
 
 
 class HttpError(Exception):
@@ -28,7 +34,15 @@ def post_json(url, payload, timeout_s=60):
             b = e.read()
         except Exception:
             b = ""
-        raise HttpError("HTTPError %s: %s" % (getattr(e, "code", "?"), b))
+        # 尝试提取 JSON 中的 detail 字段 (FastAPI 默认错误格式)
+        msg = b
+        try:
+            j = json.loads(b)
+            if "detail" in j:
+                msg = j["detail"]
+        except Exception:
+            pass
+        raise HttpError("HTTPError %s: %s" % (getattr(e, "code", "?"), msg))
     except urllib2.URLError as e:
         raise HttpError("URLError: %s" % (str(e)))
     except Exception as e:
