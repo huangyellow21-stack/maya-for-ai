@@ -38,6 +38,18 @@ class ConfirmationError(Exception):
         self.options = options
 
 
+def tool_ask_user_confirmation(args):
+    """
+    Raise ConfirmationError so agent.py catches it and renders a UI confirmation card.
+    This is intentionally not a 'real' tool — the agent intercepts the exception
+    and returns a confirm-type payload to the front-end instead of executing.
+    """
+    action = args.get("action", u"\u64cd\u4f5c")
+    target = args.get("target", u"\u76ee\u6807")
+    options = args.get("options") or [u"\u786e\u5b9a", u"\u53d6\u6d88"]
+    raise ConfirmationError(action=action, target=target, options=options)
+
+
 def _ensure_selection():
     sel = cmds.ls(sl=True, fl=True) or []
     if not sel:
@@ -135,7 +147,201 @@ def tool_list_cameras(args):
     return {"cameras": out, "count": len(out)}
 
 
+# Default nodes that Maya creates in every new scene - we filter these out
+_DEFAULT_CAMERAS    = {"persp", "perspShape", "top", "topShape", "front", "frontShape",
+                       "side", "sideShape"}
+_DEFAULT_NODES      = {"defaultLightSet", "defaultObjectSet", "initialShadingGroup",
+                       "initialParticleSE", "lambert1", "particleCloud1",
+                       "shaderGlow1", "defaultRenderLayer", "renderLayerManager",
+                       "layerManager", "defaultLayer", "lightLinker1",
+                       "strokeGlobals", "hardwareRenderGlobals",
+                       "defaultHardwareRenderGlobals", "defaultRenderGlobals",
+                       "defaultRenderQuality", "defaultResolution",
+                       "renderGlobalsList1", "defaultTextureList1",
+                       "ikSystem", "dynController1",
+                       "time1", "sequenceManager1"}
+
+
+def tool_scan_scene_summary(args):
+    u"""
+    Scans the entire scene and returns a structured, human-readable summary.
+    Automatically:
+      - Excludes all default Maya cameras (persp/top/front/side)
+      - Excludes Maya system nodes
+      - Detects rigged characters: joint hierarchies that own mesh children
+      - Groups all scene content into categories
+      - For large scenes (>30 objects per category) provides counts only
+    """
+    LARGE_SCENE_THRESHOLD = 30
+
+    # ---- 1. Collect all transforms and filter defaults ----
+    all_transforms = cmds.ls(type="transform", long=False) or []
+    default_cam_transforms = _DEFAULT_CAMERAS
+    # filter system nodes
+    user_transforms = []
+    for t in all_transforms:
+        if t in default_cam_transforms:
+            continue
+        if t in _DEFAULT_NODES:
+            continue
+        # skip shapes disguised as transforms (shouldn't happen but safety check)
+        if t.endswith("Shape"):
+            continue
+        user_transforms.append(t)
+
+    # ---- 2. Categorize each transform ----
+    mesh_objs      = []   # plain geometry
+    rig_roots      = []   # joint hierarchy roots (characters / rigs)
+    user_cameras   = []   # user-created cameras
+    lights_list    = []   # light nodes
+    groups         = []   # empty groups or organizers
+    curves_list    = []   # nurbs curves (controls, paths)
+    other_list     = []   # anything else
+
+    seen = set()
+
+    def _children_by_type(node, node_type):
+        return cmds.listRelatives(node, children=True, type=node_type, fullPath=False) or []
+
+    # Find joint roots (no joint parent = root joint)
+    all_joints = cmds.ls(type="joint", long=False) or []
+    joint_roots = set()
+    for j in all_joints:
+        parent = cmds.listRelatives(j, parent=True, type="joint", fullPath=False)
+        if not parent:
+            joint_roots.add(j)
+            # walk up through transform parents to find the character's top group
+            p = cmds.listRelatives(j, parent=True, fullPath=False)
+            if p:
+                joint_roots.add(p[0])
+
+    for t in user_transforms:
+        if t in seen:
+            continue
+        seen.add(t)
+
+        # check camera
+        cam_shapes = _children_by_type(t, "camera")
+        if cam_shapes:
+            try:
+                renderable = cmds.getAttr(cam_shapes[0] + ".renderable")
+            except Exception:
+                renderable = False
+            user_cameras.append({"name": t, "renderable": bool(renderable)})
+            continue
+
+        # check light
+        light_shapes = cmds.listRelatives(t, children=True,
+                                          type=["spotLight","pointLight","directionalLight",
+                                                "areaLight","ambientLight","volumeLight"],
+                                          fullPath=False) or []
+        if light_shapes:
+            lights_list.append(t)
+            continue
+
+        # check if it's a joint root or group containing a rig
+        if t in joint_roots:
+            # count meshes skinned to this rig
+            desc_joints = cmds.listRelatives(t, allDescendents=True, type="joint", fullPath=False) or []
+            desc_meshes = cmds.listRelatives(t, allDescendents=True, type="mesh", fullPath=False) or []
+            # look for skinCluster connections
+            has_skin = False
+            for m in desc_meshes:
+                hist = cmds.listHistory(m, type="skinCluster") or []
+                if hist:
+                    has_skin = True
+                    break
+            rig_roots.append({
+                "name": t,
+                "joint_count": len(desc_joints),
+                "mesh_count": len(desc_meshes),
+                "is_skinned": has_skin,
+            })
+            # mark all descendants as seen
+            descs = cmds.listRelatives(t, allDescendents=True, fullPath=False) or []
+            seen.update(descs)
+            continue
+
+        # check mesh
+        mesh_shapes = _children_by_type(t, "mesh")
+        if mesh_shapes:
+            # get poly count
+            try:
+                poly_count = cmds.polyEvaluate(t, face=True) or 0
+            except Exception:
+                poly_count = 0
+            mesh_objs.append({"name": t, "faces": poly_count})
+            continue
+
+        # check nurbs curve (control curve or path)
+        curve_shapes = _children_by_type(t, "nurbsCurve")
+        if curve_shapes:
+            curves_list.append(t)
+            continue
+
+        # check if it's an empty group
+        children = cmds.listRelatives(t, children=True, fullPath=False) or []
+        if not children:
+            # empty transform, skip (probably a group anchor)
+            continue
+
+        # non-empty group – descend is already covered via other transforms
+        # but record named groups that act as organizers
+        all_child_types = set()
+        for c in children:
+            shapes = cmds.listRelatives(c, shapes=True, fullPath=False) or []
+            for s in shapes:
+                all_child_types.add(cmds.nodeType(s) or "unknown")
+        groups.append({"name": t, "children": len(children)})
+
+    # ---- 3. Build summary ----
+    summary = {}
+
+    if rig_roots:
+        if len(rig_roots) <= LARGE_SCENE_THRESHOLD:
+            summary["rigged_characters"] = rig_roots
+        else:
+            summary["rigged_characters"] = {
+                "count": len(rig_roots),
+                "note": u"场景角色过多，仅显示数量"
+            }
+
+    if mesh_objs:
+        if len(mesh_objs) <= LARGE_SCENE_THRESHOLD:
+            summary["geometry"] = mesh_objs
+        else:
+            total_faces = sum(m["faces"] for m in mesh_objs)
+            summary["geometry"] = {
+                "count": len(mesh_objs),
+                "total_faces": total_faces,
+                "note": u"几何体过多，仅显示汇总"
+            }
+
+    if user_cameras:
+        summary["user_cameras"] = user_cameras
+
+    if lights_list:
+        summary["lights"] = lights_list
+
+    if curves_list:
+        if len(curves_list) <= LARGE_SCENE_THRESHOLD:
+            summary["nurbs_curves"] = curves_list
+        else:
+            summary["nurbs_curves"] = {"count": len(curves_list)}
+
+    if groups:
+        summary["organizer_groups"] = [g["name"] for g in groups]
+
+    summary["total_user_objects"] = (
+        len(rig_roots) + len(mesh_objs) + len(user_cameras) +
+        len(lights_list) + len(curves_list) + len(groups)
+    )
+
+    return summary
+
+
 def tool_select_by_name_pattern(args):
+
     pattern = args.get("pattern")
     if not isinstance(pattern, basestring) or not pattern.strip():
         raise ToolError("ARG_VALIDATION_FAILED", "pattern 不能为空")
@@ -1306,6 +1512,289 @@ def tool_import_bomb_asset(args):
     return {"path": path, "namespace": namespace}
 
 
+def tool_create_three_point_lighting(args):
+    """创建三点基础布光"""
+    target = args.get("target") or ""
+    base_intensity = float(args.get("intensity", 1.0))
+    import maya.cmds as cmds
+    try:
+        # 智能判定物体包围盒
+        bbox = None
+        if target and cmds.objExists(target):
+            bbox = cmds.exactWorldBoundingBox(target)
+        else:
+            sel = cmds.ls(sl=True) or []
+            if sel:
+                bbox = cmds.exactWorldBoundingBox(sel)
+                
+        if bbox:
+            cx = (bbox[0] + bbox[3]) / 2.0
+            cy = (bbox[1] + bbox[4]) / 2.0
+            cz = (bbox[2] + bbox[5]) / 2.0
+            max_dim = max(bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2])
+            if max_dim < 0.1: max_dim = 10.0
+        else:
+            cx, cy, cz = 0.0, 0.0, 0.0
+            max_dim = 20.0
+            
+        dist = max_dim * 1.5
+        intensity = base_intensity
+        
+        # Key Light
+        key = cmds.directionalLight(name="Key_Light", intensity=intensity * 1.2)
+        key_transform = cmds.listRelatives(key, parent=True)[0]
+        cmds.setAttr(key_transform + ".translate", cx + dist, cy + dist, cz + dist)
+        cmds.setAttr(key_transform + ".rotate", -45, 45, 0)
+        cmds.setAttr(key + ".useDepthMapShadows", 1)
+        
+        # Fill Light
+        fill = cmds.directionalLight(name="Fill_Light", intensity=intensity * 0.5)
+        fill_transform = cmds.listRelatives(fill, parent=True)[0]
+        cmds.setAttr(fill_transform + ".translate", cx - dist, cy + dist*0.5, cz + dist)
+        cmds.setAttr(fill_transform + ".rotate", -20, -45, 0)
+        
+        # Back Light
+        back = cmds.directionalLight(name="Back_Light", intensity=intensity * 1.5)
+        back_transform = cmds.listRelatives(back, parent=True)[0]
+        cmds.setAttr(back_transform + ".translate", cx, cy + dist*1.5, cz - dist*1.5)
+        cmds.setAttr(back_transform + ".rotate", -45, 180, 0)
+        
+        # Group them
+        group = cmds.group([key_transform, fill_transform, back_transform], name="ThreePointLighting_Grp")
+        
+        # If target, aim lights at target
+        aim_target = target if (target and cmds.objExists(target)) else (cmds.ls(sl=True)[0] if cmds.ls(sl=True) else None)
+        if aim_target:
+            cmds.aimConstraint(aim_target, key_transform, aimVector=(0,0,-1))
+            cmds.aimConstraint(aim_target, fill_transform, aimVector=(0,0,-1))
+            cmds.aimConstraint(aim_target, back_transform, aimVector=(0,0,-1))
+            
+    except Exception as e:
+        raise ToolError("MAYA_COMMAND_FAILED", "创建三点布光失败：%s" % str(e))
+        
+    return {
+        "summary": "根据场景尺寸（包围盒）自动计算了灯光放置距离并完成了打光，主光倍增为 %s。" % round(intensity * 1.2, 2),
+        "group": group, 
+        "lights": [key_transform, fill_transform, back_transform]
+    }
+
+def tool_create_turntable(args):
+    """创建环绕展示摄像机"""
+    target = args.get("target") or ""
+    frames = int(args.get("frames", 120))
+    import maya.cmds as cmds
+    try:
+        # 智能判定物体包围盒
+        bbox = None
+        sel_target = None
+        if target and cmds.objExists(target):
+            bbox = cmds.exactWorldBoundingBox(target)
+            sel_target = target
+        else:
+            sel = cmds.ls(sl=True) or []
+            if sel:
+                bbox = cmds.exactWorldBoundingBox(sel)
+                sel_target = sel[0]
+                
+        if bbox:
+            cx = (bbox[0] + bbox[3]) / 2.0
+            cy = (bbox[1] + bbox[4]) / 2.0
+            cz = (bbox[2] + bbox[5]) / 2.0
+            max_dim = max(bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2])
+            if max_dim < 0.1: max_dim = 10.0
+            # 自适应距离和高度
+            calc_distance = max_dim * 2.2
+            calc_height = (bbox[4] - bbox[1]) * 0.35 + cy
+        else:
+            cx, cy, cz = 0.0, 0.0, 0.0
+            calc_distance = 20.0
+            calc_height = 5.0
+            
+        dist = float(args.get("distance", calc_distance))
+
+        loc_name = "Turntable_Center" if not sel_target else "Turntable_Center_" + sel_target
+        loc = cmds.spaceLocator(name=loc_name)[0]
+        cmds.xform(loc, translation=[cx, calc_height, cz], worldSpace=True)
+            
+        cam, cam_shape = cmds.camera(name="Turntable_Camera")
+        cmds.setAttr(cam + ".translateZ", dist)
+        
+        # Group the camera into the locator
+        cmds.parent(cam, loc)
+        
+        # Keyframe the locator to spin 360 degrees
+        start_time = cmds.playbackOptions(query=True, minTime=True)
+        end_time = start_time + frames
+        
+        cmds.setKeyframe(loc, attribute="rotateY", t=start_time, v=0)
+        cmds.setKeyframe(loc, attribute="rotateY", t=end_time, v=360)
+        
+        # Make it linear
+        cmds.selectKey(loc, attribute="rotateY")
+        cmds.keyTangent(inTangentType="linear", outTangentType="linear")
+        cmds.playbackOptions(animationStartTime=start_time, animationEndTime=end_time, maxTime=end_time)
+        
+    except Exception as e:
+        raise ToolError("MAYA_COMMAND_FAILED", "创建环绕摄像机失败：%s" % str(e))
+        
+    return {
+        "summary": "根据对象尺寸智能设置了摄像机旋转半径 %s 和目标高度 %s" % (round(dist, 1), round(calc_height, 1)),
+        "camera": cam,
+        "center_locator": loc,
+        "frames": frames
+    }
+    # v2.2: update memory
+    try:
+        EntityMemory.update_last_created("camera", cam)
+    except Exception:
+        pass
+
+
+def tool_cleanup_scene(args):
+    """清理选中物体的历史、冻结变换、居中枢轴"""
+    import maya.cmds as cmds
+    import maya.mel as mel
+    
+    sel = cmds.ls(sl=True, type="transform") or []
+    if not sel:
+        # Prompt user contextually if nothing selected
+        from .maya_tools import ConfirmationError
+        raise ConfirmationError(
+            action="清理整个场景",
+            target="所有物体",
+            options=["是，清理全部", "取消"]
+        )
+        
+    cmds.undoInfo(openChunk=True)
+    try:
+        # 1. Delete Non-Deformer History
+        # mel.eval('BakeNonDefHistory') -> but python safe is better
+        # Actually bakePartialHistory is safer in python
+        for obj in sel:
+            cmds.bakePartialHistory(obj, prePostDeformers=True)
+            
+        # 2. Freeze Transforms
+        cmds.makeIdentity(sel, apply=True, t=1, r=1, s=1, n=0, pn=1)
+        
+        # 3. Center Pivot
+        cmds.xform(sel, centerPivots=True)
+    except Exception as e:
+        cmds.undoInfo(closeChunk=True)
+        raise ToolError("MAYA_COMMAND_FAILED", "清理场景历史失败：%s" % str(e))
+        
+    cmds.undoInfo(closeChunk=True)
+    return {"summary": "成功清理了 %d 个物体的历史并重置了变换" % len(sel), "count": len(sel)}
+
+
+def tool_group_and_center(args):
+    """打组并居中枢轴"""
+    import maya.cmds as cmds
+    group_name = args.get("group_name") or "Auto_Group"
+    
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        raise ToolError("MAYA_SELECTION_REQUIRED", "请先选择要打组的物体")
+        
+    cmds.undoInfo(openChunk=True)
+    try:
+        grp = cmds.group(sel, name=group_name)
+        cmds.xform(grp, centerPivots=True)
+    except Exception as e:
+        cmds.undoInfo(closeChunk=True)
+        raise ToolError("MAYA_COMMAND_FAILED", "打组失败：%s" % str(e))
+        
+    cmds.undoInfo(closeChunk=True)
+    return {"summary": "成功将 %d 个物体打组为 %s，并居中了枢轴" % (len(sel), grp), "group": grp}
+
+
+def tool_randomize_transforms(args):
+    """随机变换选中物体"""
+    import maya.cmds as cmds
+    import random
+    
+    sel = cmds.ls(sl=True, type="transform") or []
+    if not sel:
+        raise ToolError("MAYA_SELECTION_REQUIRED", "请先在 Maya 中选中要随机打散的物体")
+        
+    t_min = args.get("translate_min", [0,0,0])
+    t_max = args.get("translate_max", [0,0,0])
+    r_min = args.get("rotate_min", [0,0,0])
+    r_max = args.get("rotate_max", [0,0,0])
+    s_min = args.get("scale_min", [1,1,1])
+    s_max = args.get("scale_max", [1,1,1])
+    uniform_scale = args.get("uniform_scale", True)
+    
+    cmds.undoInfo(openChunk=True)
+    try:
+        for obj in sel:
+            tx = random.uniform(t_min[0], t_max[0])
+            ty = random.uniform(t_min[1], t_max[1])
+            tz = random.uniform(t_min[2], t_max[2])
+            
+            rx = random.uniform(r_min[0], r_max[0])
+            ry = random.uniform(r_min[1], r_max[1])
+            rz = random.uniform(r_min[2], r_max[2])
+            
+            cmds.xform(obj, relative=True, translation=[tx, ty, tz])
+            cmds.xform(obj, relative=True, rotation=[rx, ry, rz])
+            
+            if uniform_scale:
+                s = random.uniform(s_min[0], s_max[0])
+                cmds.setAttr(obj + ".scale", s, s, s)
+            else:
+                sx = random.uniform(s_min[0], s_max[0])
+                sy = random.uniform(s_min[1], s_max[1])
+                sz = random.uniform(s_min[2], s_max[2])
+                cmds.setAttr(obj + ".scale", sx, sy, sz)
+    except Exception as e:
+        cmds.undoInfo(closeChunk=True)
+        raise ToolError("MAYA_COMMAND_FAILED", "随机变换失败：%s" % str(e))
+        
+    cmds.undoInfo(closeChunk=True)
+    return {"summary": "成功随机打散了 %d 个选中物体" % len(sel)}
+
+
+def tool_assign_color_materials(args):
+    """快速创建并赋予纯色材质"""
+    import maya.cmds as cmds
+    import random
+    
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        raise ToolError("MAYA_SELECTION_REQUIRED", "请先在 Maya 中选中要赋予材质的物体")
+        
+    color = args.get("color")
+    random_colors = args.get("random_colors", False)
+    
+    cmds.undoInfo(openChunk=True)
+    try:
+        assigned_mats = []
+        for obj in sel:
+            # Create a simple lambert
+            mat = cmds.shadingNode("lambert", asShader=True)
+            sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=mat + "SG")
+            cmds.connectAttr(mat + ".outColor", sg + ".surfaceShader", force=True)
+            
+            if random_colors:
+                c = [random.random(), random.random(), random.random()]
+            elif color and len(color) == 3:
+                # Clamp safely
+                c = [max(0, min(1, float(color[0]))), max(0, min(1, float(color[1]))), max(0, min(1, float(color[2])))]
+            else:
+                c = [0.8, 0.8, 0.8] # Default gray
+                
+            cmds.setAttr(mat + ".color", c[0], c[1], c[2], type="double3")
+            
+            cmds.sets(obj, forceElement=sg)
+            assigned_mats.append(mat)
+    except Exception as e:
+        cmds.undoInfo(closeChunk=True)
+        raise ToolError("MAYA_COMMAND_FAILED", "赋予材质失败：%s" % str(e))
+        
+    cmds.undoInfo(closeChunk=True)
+    return {"summary": "成功为 %d 个物体创建并赋予了材质" % len(sel), "materials": assigned_mats}
+
+
 def _get_target_and_source(args, allow_fallback=True):
     source = args.get("source")
     target = args.get("target")
@@ -1834,7 +2323,7 @@ TOOLS = [
         "name": "maya.list_tools",
         "description": "返回可用工具的清单（名称与描述）。",
         "input_schema": {"type": "object", "properties": {}, "required": []},
-        "handler": lambda _args: [{"name": t["name"], "description": t["description"]} for t in TOOLS[1:]],
+        "handler": lambda _args: [{"name": t["name"], "description": t["description"]} for t in TOOLS],
     },
     {
         "name": "maya.list_selection",
@@ -1856,8 +2345,20 @@ TOOLS = [
         "handler": tool_list_cameras,
     },
     {
+        "name": "maya.scan_scene_summary",
+        "description": (
+            u"扫描整个场景并返回结构化的场景摘要。"
+            u"自动过滤 Maya 默认相机（persp/top/front/side）和系统节点，"
+            u"识别绑定角色（含 joint 层级和皮肤权重）、几何体、用户相机、灯光、曲线。"
+            u"大型场景返回数量汇总，小型场景返回详细列表。"
+            u"当用户询问\u300c场景中有什么\u300d或\u300c场景内容\u300d时，优先使用此工具。"
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "handler": tool_scan_scene_summary,
+    },
+    {
         "name": "maya.select_by_name_pattern",
-        "description": "按名称通配符选择对象，可按类型过滤。",
+        "description": u"\u6309\u540d\u79f0\u901a\u914d\u7b26\u9009\u62e9\u5bf9\u8c61\uff0c\u53ef\u6309\u7c7b\u578b\u8fc7\u6ee4\u3002",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2215,7 +2716,7 @@ TOOLS = [
     },
     {
         "name": "maya.import_bomb_asset",
-        "description": "导入 Bomb 爆炸资产（自动识别路径，可传入自定义 path）。",
+        "description": "导入或创建 Bomb 爆炸资产（特效）、炸弹。如果用户让你“创建爆炸”、“生成爆炸”或制作爆炸效果，请务必直接调用此工具，不要自己写代码。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2225,6 +2726,33 @@ TOOLS = [
             "required": []
         },
         "handler": tool_import_bomb_asset,
+    },
+    {
+        "name": "maya.create_three_point_lighting",
+        "description": "创建标准的三点布光（主光、辅光、背光/轮廓光）系统。当用户请求打光、布光、照亮场景时调用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "被照亮的目标物体名称（可选，会自动根据选中物体包围盒智能计算）"},
+                "intensity": {"type": "number", "default": 1.0, "description": "光照强度倍增基数（可选）"}
+            },
+            "required": []
+        },
+        "handler": tool_create_three_point_lighting,
+    },
+    {
+        "name": "maya.create_turntable",
+        "description": "创建一个自动环绕目标旋转 360 度的展示摄像机（Turntable Camera）。当用户请求创建展示平台、环绕镜头、围绕物体旋转的摄像机时调用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "要环绕的目标物体名称（若空则绕选中物体，自动计算bbox半径）"},
+                "frames": {"type": "number", "default": 120, "description": "旋转一圈所需的动画帧数"},
+                "distance": {"type": "number", "description": "摄像机距离目标的距离半径（非必要不要填，系统会根据物体智能计算）"}
+            },
+            "required": []
+        },
+        "handler": tool_create_turntable,
     },
     {
         "name": "maya.create_object_and_camera_and_aim",
@@ -2273,43 +2801,256 @@ TOOLS = [
             },
             "required": ["camera"]
         },
+        # We use a lambda here because `tool_add_camera_jitter` is defined AFTER this list in the file.
+        # Python resolves lambdas at runtime, preventing a NameError during module initialization.
         "handler": lambda args: tool_add_camera_jitter(args)
     },
     {
         "name": "maya.ask_user_confirmation",
-        "description": "遇到涉及删除场景、大面积重置或者极其影响文件的破坏性操作时，主动调用此工具向用户弹出确认卡片。",
+        "description": "如果用户的请求含糊不清需要澄清，或者非常危险（如删除场景、写入文件），使用此工具弹出 UI 卡片选项框。参数 options 为一个字符串数组，展示给用户按键。",
         "input_schema": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "description": "即将执行的破坏性操作描述，例如 '清除所有动画关键帧'"},
-                "target": {"type": "string", "description": "操作的目标对象，例如 '当前场景全选物体'"},
+                "action": {"type": "string", "description": "即将执行的动作标题，比如'删除场景'"},
+                "target": {"type": "string", "description": "影响的目标，比如'整个工程'"},
                 "options": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "提供给用户的按钮选项。一般为 ['确认删除', '取消操作并手动另存为'] 等",
-                    "default": ["确认执行", "取消"]
+                    "description": "提供给用户的选项按钮文字数组，如 ['确定', '取消']"
                 }
             },
-            "required": ["action", "target"]
+            "required": ["action", "target", "options"]
         },
-        "handler": lambda args: tool_ask_user_confirmation(args)
+        "handler": tool_ask_user_confirmation,
+    },
+    {
+        "name": "maya.cleanup_scene",
+        "description": "一键清理选中物体的构建历史（烘焙变形器之外的构造记录）、冻结坐标变换（清零SRT偏移）、并居中枢轴。如果没有选中，它会弹窗询问是否清理全部。当你收到优化场景、清理历史、清零坐标、居中坐标轴的指令时调用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+        "handler": tool_cleanup_scene,
+    },
+    {
+        "name": "maya.group_and_center",
+        "description": "打组并居中枢轴。将用户当前选中的零散物体自动打组成一个新的层级组，并且组节点的中心点会自动对齐到这堆物体的绝对中心。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_name": {"type": "string", "default": "Auto_Group", "description": "新打的组的名称"}
+            },
+            "required": []
+        },
+        "handler": tool_group_and_center,
+    },
+    {
+        "name": "maya.randomize_transforms",
+        "description": "散布 / 随机变换。对选中的一组物体随机偏移位置、旋转、缩放。用来快速制作满地散落物体、凌乱的石头/树木极其好用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "translate_min": {"type": "array", "items": {"type": "number"}, "description": "[xmin, ymin, zmin] 可选"},
+                "translate_max": {"type": "array", "items": {"type": "number"}, "description": "[xmax, ymax, zmax] 可选"},
+                "rotate_min": {"type": "array", "items": {"type": "number"}, "description": "[xmin, ymin, zmin] 旋转下限"},
+                "rotate_max": {"type": "array", "items": {"type": "number"}, "description": "[xmax, ymax, zmax] 旋转上限"},
+                "scale_min": {"type": "array", "items": {"type": "number"}, "description": "[sx, sy, sz] 或直接通过 uniform_scale 控制单轴统一缩放"},
+                "scale_max": {"type": "array", "items": {"type": "number"}, "description": "[sx, sy, sz]"},
+                "uniform_scale": {"type": "boolean", "default": True, "description": "是否等比缩放"}
+            },
+            "required": []
+        },
+        "handler": tool_randomize_transforms,
+    },
+    {
+        "name": "maya.assign_color_materials",
+        "description": "快速纯色涂装工具。能够瞬间为选定的一个或一批模型分别创建带颜色的 Lambert 材质并赋予它们。解决手补材质繁琐且容易报错的痛点。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "color": {"type": "array", "items": {"type": "number"}, "description": "RGB 数组 [R, G, B] 每项目0-1。如果为空则随机"},
+                "random_colors": {"type": "boolean", "default": False, "description": "如果为 true，则给选中的每个物体赋予完全独立随机色彩的材质"}
+            },
+            "required": []
+        },
+        "handler": tool_assign_color_materials,
     },
     {
         "name": "maya.execute_python_code",
-        "description": "在 Maya 环境中动态执行任何符合规范的 Python 代码。当预设工具无法满足用户的自由需求时，你必须自己编写 `import maya.cmds as cmds` 的代码并使用这个工具执行。这能让你完成几乎所有要求！",
+        "description": "在 Maya 环境中动态执行任何符合规范的 Python 代码。这是你最强大的工具！当预设工具无法满足需求时（例如：“建10个小球”、“把选中物体全部重命名”等批量/循环操作），你必须自己编写合乎逻辑的 Maya Python 代码并使用这个工具一次性执行。切忌为了批量操作而人工循环调用其他单步工具！",
         "input_schema": {
             "type": "object",
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "包含合法 Maya Python 命令的多行脚本代码。例如：\nimport maya.cmds as cmds\ncmds.polyCube(n='myCube')\n"
+                    "description": "包含合法 Maya Python 命令的多行脚本代码。例如：\nimport maya.cmds as cmds\nfor i in range(10):\n    cmds.polyCube(n='myCube_%d' % i)\n"
                 }
             },
             "required": ["code"]
         },
         "handler": lambda args: tool_execute_python_code(args)
-    }
+    },
+    # ── v2.1 新增工具 ────────────────────────────────────────────────
+    {
+        "name": "maya.camera_look_at",
+        "description": "让指定摄像机朝向目标对象（先创建 aimConstraint，执行后立即删除约束，保持静帧朝向）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "camera": {"type": "string", "description": "摄像机名称，例如 'camera1'"},
+                "target": {"type": "string", "description": "目标对象名称，例如 'pSphere1'"}
+            },
+            "required": ["camera", "target"]
+        },
+        "handler": lambda args: _tool_camera_look_at(args),
+    },
+    {
+        "name": "maya.camera_frame_selection",
+        "description": "让摄像机框选/聚焦当前选中物体（等同于按 F 键）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "camera": {"type": "string", "description": "摄像机名称（可选），留空则使用当前活动摄像机"}
+            },
+            "required": []
+        },
+        "handler": lambda args: _tool_camera_frame_selection(args),
+    },
+    {
+        "name": "maya.duplicate_objects",
+        "description": "复制当前选中的物体，返回新创建节点列表。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "smart_transform": {"type": "boolean", "default": False, "description": "是否使用 smartTransform 复制方式"}
+            },
+            "required": []
+        },
+        "handler": lambda args: _tool_duplicate_objects(args),
+    },
+    {
+        "name": "maya.delete_selected",
+        "description": "删除当前场景中选中的对象。破坏性操作，调用前应经过 ask_user_confirmation 确认。",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+        "handler": lambda args: _tool_delete_selected(args),
+    },
+    {
+        "name": "maya.freeze_transforms",
+        "description": "对当前选中对象冻结变换（位移/旋转/缩放归零）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "translate": {"type": "boolean", "default": True},
+                "rotate":    {"type": "boolean", "default": True},
+                "scale":     {"type": "boolean", "default": True}
+            },
+            "required": []
+        },
+        "handler": lambda args: _tool_freeze_transforms(args),
+    },
+    {
+        "name": "maya.center_pivot",
+        "description": "将当前选中对象的轴心居中（等同于 Modify > Center Pivot）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+        "handler": lambda args: _tool_center_pivot(args),
+    },
+    {
+        "name": "maya.parent_objects",
+        "description": "建立父子层级：将 child 物体设为 parent 物体的子节点。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "child":  {"type": "string", "description": "子节点名称"},
+                "parent": {"type": "string", "description": "父节点名称"}
+            },
+            "required": ["child", "parent"]
+        },
+        "handler": lambda args: _tool_parent_objects(args),
+    },
 ]
+
+# ── v2.1 新工具实现 ────────────────────────────────────────────────────────
+
+def _tool_camera_look_at(args):
+    camera = args.get("camera", "")
+    target = args.get("target", "")
+    if not camera or not cmds.objExists(camera):
+        raise ToolError("PARAM", u"摄像机不存在: %s" % camera)
+    if not target or not cmds.objExists(target):
+        raise ToolError("PARAM", u"目标对象不存在: %s" % target)
+    con = cmds.aimConstraint(target, camera, maintainOffset=False)
+    cmds.delete(con)
+    return {"camera": camera, "target": target,
+            "message": u"摄像机 %s 已朝向 %s" % (camera, target)}
+
+def _tool_camera_frame_selection(args):
+    camera = args.get("camera") or ""
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        raise ToolError("MAYA_NO_SELECTION", u"没有选中任何物体，请先选择要框选的对象")
+    if camera and cmds.objExists(camera):
+        cmds.viewFit(camera, fitFactor=1.0)
+    else:
+        cmds.viewFit(fitFactor=1.0)
+    return {"camera": camera or "active",
+            "selected": sel,
+            "message": u"已框选 %d 个物体到摄像机视图" % len(sel)}
+
+def _tool_duplicate_objects(args):
+    smart = args.get("smart_transform", False)
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        raise ToolError("MAYA_NO_SELECTION", u"请先选择要复制的物体")
+    new_nodes = cmds.duplicate(smartTransform=smart) or []
+    return {"created": new_nodes,
+            "message": u"已复制 %d 个物体" % len(new_nodes)}
+
+def _tool_delete_selected(args):
+    sel = cmds.ls(sl=True, fl=True) or []
+    if not sel:
+        raise ToolError("MAYA_NO_SELECTION", u"没有选中任何对象")
+    cmds.delete(sel)
+    return {"deleted": sel,
+            "message": u"已删除 %d 个对象" % len(sel)}
+
+def _tool_freeze_transforms(args):
+    t = args.get("translate", True)
+    r = args.get("rotate", True)
+    s = args.get("scale", True)
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        raise ToolError("MAYA_NO_SELECTION", u"没有选中任何对象")
+    cmds.makeIdentity(apply=True, t=int(t), r=int(r), s=int(s), n=0)
+    return {"objects": sel,
+            "message": u"已冻结变换（t=%s, r=%s, s=%s）" % (t, r, s)}
+
+def _tool_center_pivot(args):
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        raise ToolError("MAYA_NO_SELECTION", u"没有选中任何对象")
+    cmds.xform(centerPivots=True)
+    return {"objects": sel,
+            "message": u"已将 %d 个对象的轴心居中" % len(sel)}
+
+def _tool_parent_objects(args):
+    child  = args.get("child", "")
+    parent = args.get("parent", "")
+    if not child or not cmds.objExists(child):
+        raise ToolError("PARAM", u"子节点不存在: %s" % child)
+    if not parent or not cmds.objExists(parent):
+        raise ToolError("PARAM", u"父节点不存在: %s" % parent)
+    cmds.parent(child, parent)
+    return {"child": child, "parent": parent,
+            "message": u"已将 %s 设为 %s 的子节点" % (child, parent)}
 
 def tool_add_camera_jitter(args):
     camera = args.get("camera")
@@ -2342,18 +3083,30 @@ def tool_execute_python_code(args):
     code = args.get("code")
     if not code:
         raise ToolError("PARAM", "未提供要执行的 Python 代码 (code 参数为空)")
-        
+
+    # v2.2 安全过滤：禁止导入危险模块
+    _BLOCKED = ["import os", "import sys", "import subprocess",
+                "__import__", "os.system", "os.popen", "subprocess."]
+    for blocked in _BLOCKED:
+        if blocked in code:
+            raise ToolError("SECURITY",
+                u"禁止导入系统模块或调用系统命令：请勿使用 '%s'。"
+                u"需要媒体操作请直接使用 cmds。" % blocked)
+
     # Create a clean namespace but inject maya.cmds and maya.mel
     import maya.cmds as cmds
     import maya.mel as mel
     import sys
-    from io import StringIO
+    import cStringIO
+    import traceback
     
     # Simple output capture
     old_stdout = sys.stdout
     old_stderr = sys.stderr
-    sys.stdout = capture_out = StringIO()
-    sys.stderr = capture_err = StringIO()
+    capture_out = cStringIO.StringIO()
+    capture_err = cStringIO.StringIO()
+    sys.stdout = capture_out
+    sys.stderr = capture_err
     
     namespace = {"cmds": cmds, "mel": mel}
     
@@ -2365,7 +3118,6 @@ def tool_execute_python_code(args):
         exec(code, namespace)
         success = True
     except Exception as e:
-        import traceback
         traceback.print_exc()
         success = False
     finally:
@@ -2376,12 +3128,18 @@ def tool_execute_python_code(args):
     stderr_val = capture_err.getvalue()
     
     if not success:
-        raise ToolError("EXECUTION_FAILED", "Python 脚本执行报错:\n%s" % stderr_val)
+        err_msg = u"Python 脚本执行报错:\n%s\n标准输出:\n%s" % (
+            stderr_val.decode('utf-8', 'ignore') if isinstance(stderr_val, str) else stderr_val,
+            stdout_val.decode('utf-8', 'ignore') if isinstance(stdout_val, str) else stdout_val
+        )
+        raise ToolError("EXECUTION_FAILED", err_msg)
         
+    s_out = stdout_val.decode('utf-8', 'ignore') if isinstance(stdout_val, str) else stdout_val
     return {
         "success": True, 
-        "stdout": stdout_val,
-        "message": "代码已成功在 Maya 内部执行。"
+        "stdout": s_out,
+        "message": u"代码已成功在 Maya 内部执行。",
+        "summary": u"执行了一段自定义 Python 脚本。\n%s" % (u"输出: " + s_out.strip() if s_out.strip() else u"（无打印输出）")
     }
 
 

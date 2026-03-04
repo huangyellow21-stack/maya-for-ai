@@ -111,6 +111,7 @@ class WorkerSignals(QtCore.QObject):
     chat_finished = QtCore.Signal(object, object)
     chat_error = QtCore.Signal(str)
     gateway_status = QtCore.Signal(str, str)
+    status_update = QtCore.Signal(str)  # v2.1: 实时状态 (思考中/执行中/完成)
 
 
 class ApiKeyDialog(QtWidgets.QDialog):
@@ -185,6 +186,8 @@ class AiformayaWidget(QtWidgets.QWidget):
 
         self._ai_placeholder_item = None
         self._gateway_running = False
+        self._executing_plan = False
+        self._pending_high_risk_plan = None
 
         self._build_ui()
         self._load_cfg_to_ui()
@@ -371,7 +374,7 @@ class AiformayaWidget(QtWidgets.QWidget):
         self.restartGatewayBtn = QtWidgets.QPushButton("Restart")
         self.restartGatewayBtn.setObjectName("DangerButton")
         self.restartGatewayBtn.setFixedHeight(36)
-        self.restartGatewayBtn.setFixedWidth(60)
+        self.restartGatewayBtn.setFixedWidth(80)
         self.restartGatewayBtn.clicked.connect(self._on_restart_gateway_clicked)
         self.restartGatewayBtn.setVisible(False)
         gateway_row.addWidget(self.restartGatewayBtn)
@@ -470,15 +473,6 @@ class AiformayaWidget(QtWidgets.QWidget):
         self.temperatureValue.setAlignment(QtCore.Qt.AlignCenter)
         temp_row.addWidget(self.temperatureValue)
         settings_layout_inner.addLayout(temp_row)
-        mode_row = QtWidgets.QHBoxLayout()
-        mode_label = QtWidgets.QLabel("Mode")
-        mode_label.setObjectName("FieldLabel")
-        mode_row.addWidget(mode_label)
-        self.modeBox = QtWidgets.QComboBox()
-        self.modeBox.addItems(["编辑模式", "问询模式"])
-        self.modeBox.setFixedHeight(36)
-        mode_row.addWidget(self.modeBox, 1)
-        settings_layout_inner.addLayout(mode_row)
         btn_row = QtWidgets.QHBoxLayout()
         self.saveBtn = QtWidgets.QPushButton("Save Config")
         self.saveBtn.setObjectName("SecondaryButton")
@@ -514,6 +508,28 @@ class AiformayaWidget(QtWidgets.QWidget):
         chat_layout.addLayout(chat_header)
         self._userAvatar = self._load_pixmap(u"聊天气泡头像（用户).png", 32)
         self._aiAvatar = self._load_pixmap(u"聊天气泡头像(AI 头像）.png", 32)
+        self._executing_plan = False
+        self._pending_high_risk_plan = None
+
+        # Edit Mode Banner (default hidden)
+        self.editModeBanner = QtWidgets.QFrame()
+        self.editModeBanner.setObjectName("EditModeBanner")
+        banner_layout = QtWidgets.QHBoxLayout(self.editModeBanner)
+        banner_layout.setContentsMargins(12, 6, 12, 6)
+        banner_icon = QtWidgets.QLabel(u"\u26a1")
+        banner_icon.setStyleSheet("color: #FF9800; font-size: 14px;")
+        banner_layout.addWidget(banner_icon)
+        self.editModeBannerLabel = QtWidgets.QLabel(u"\u7f16\u8f91\u6a21\u5f0f  \u2014  \u5bf9\u8bdd\u5c06\u76f4\u63a5\u4fee\u6539\u573a\u666f\uff0cCtrl+Z \u53ef\u64a4\u9500")
+        self.editModeBannerLabel.setStyleSheet("color: #FFCC80; font-size: 12px; font-weight: 600;")
+        banner_layout.addWidget(self.editModeBannerLabel, 1)
+        banner_exit_btn = QtWidgets.QPushButton(u"\u9000\u51fa\u7f16\u8f91")
+        banner_exit_btn.setObjectName("SecondaryButton")
+        banner_exit_btn.setFixedHeight(24)
+        banner_exit_btn.clicked.connect(lambda: self._set_edit_mode(False))
+        banner_layout.addWidget(banner_exit_btn)
+        self.editModeBanner.setVisible(False)
+        chat_layout.addWidget(self.editModeBanner)
+
         self.chatList = QtWidgets.QListWidget()
         self.chatList.setObjectName("ChatList")
         self.chatList.setSpacing(10)
@@ -536,6 +552,14 @@ class AiformayaWidget(QtWidgets.QWidget):
         self.sendBtn.setFixedHeight(36)
         self._set_icon(self.sendBtn, u"按钮图标（Send）.png", 16)
         input_row.addWidget(self.sendBtn)
+        
+        self.stopBtn = QtWidgets.QPushButton(u"停止")
+        self.stopBtn.setObjectName("DangerButton")
+        self.stopBtn.setFixedHeight(36)
+        self.stopBtn.setVisible(False)
+        self.stopBtn.clicked.connect(self.on_stop_execution)
+        input_row.addWidget(self.stopBtn)
+        
         chat_layout.addLayout(input_row)
         layout.addWidget(chat_card, 1)
 
@@ -687,7 +711,13 @@ QSlider::handle:horizontal {
     background: #21C7B7;
     border-radius: 7px;
 }
+QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; border-radius: 8px; }
 """
+        )
+
+        # Edit Mode Banner style
+        self.editModeBanner.setStyleSheet(
+            "QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; border-radius: 8px; }"
         )
 
         self.saveBtn.clicked.connect(self.on_save)
@@ -696,7 +726,7 @@ QSlider::handle:horizontal {
         self.sendBtn.clicked.connect(self.on_send)
         self.input.returnPressed.connect(self.on_send)
         self.provider.currentTextChanged.connect(self.on_provider_changed)
-        self.modeBox.currentIndexChanged.connect(self.on_mode_changed)
+        self.modeBox = None  # v2.0: mode selector removed, always conversational
         self.temperatureSlider.valueChanged.connect(self._on_temp_slider_changed)
         self.temperatureValue.valueChanged.connect(self._on_temp_value_changed)
 
@@ -713,11 +743,8 @@ QSlider::handle:horizontal {
             temp = 0.2
         self.temperatureValue.setValue(temp)
         self.temperatureSlider.setValue(int(temp * 100))
-        mode = str(self.cfg.get("mode", "edit")).strip().lower()
-        if mode == "view":
-            self.modeBox.setCurrentIndex(1)
-        else:
-            self.modeBox.setCurrentIndex(0)
+        # v2.0: mode is always 'auto' (conversational), no UI selector needed
+        self.cfg.setdefault("mode", "auto")
         self._apply_provider_ui_state()
 
     def _ui_to_cfg(self):
@@ -730,11 +757,10 @@ QSlider::handle:horizontal {
         else:
             self.cfg["model_deepseek"] = model_text
         self.cfg["temperature"] = float(self.temperatureValue.value())
-        mode_text = str(self.modeBox.currentText())
-        if "询" in mode_text:
-            self.cfg["mode"] = "view"
-        else:
-            self.cfg["mode"] = "edit"
+        # Save user-selected mode; also save as _user_mode for restore after temp edit
+        # v2.0: mode is always 'auto', no UI selector
+        self.cfg["mode"] = "auto"
+        self.cfg["_user_mode"] = "auto"
 
     def _add_chat_bubble(self, role, content, **kwargs):
         item = QtWidgets.QListWidgetItem(self.chatList)
@@ -742,23 +768,31 @@ QSlider::handle:horizontal {
         # Calculate explicit labels. Note: content might already have prefixes due to how `log()` is called.
         # So we just strip it if it already has it, and cleanly add our preferred HTML formatting.
         display_text = content
+        
+        # Strip AI reasoning (<think> tags from deepseek or similar)
+        if role == "ai":
+            import re
+            display_text = re.sub(r'<think>[\s\S]*?</think>', '', display_text).strip()
+            
         if role == "user":
             if display_text.startswith("你："):
                 display_text = display_text[2:].strip()
             # Remove any leading diamond or weird symbols sometimes sent by error
-            if display_text.startswith(u"：") or display_text.startswith(u": ") or display_text.startswith(u"❖：") or display_text.startswith(u"❖: "):
-                 display_text = display_text[2:].strip()
-            display_text = u"<b>你：</b><br>" + display_text
+            for prefix in ["：", ": ", "❖：", "❖: "]:
+                if display_text.startswith(prefix):
+                    display_text = display_text[len(prefix):].strip()
+                    break
+            display_text = "<b>你：</b><br>" + display_text
         elif role == "ai":
             if display_text.startswith("AI："):
-                 display_text = display_text[3:].strip()
-            display_text = u"<b>AI：</b><br>" + display_text
+                 display_text = display_text[len("AI："):].strip()
+            display_text = "<b>AI：</b><br>" + display_text
         else:
             if display_text.startswith("系统："):
-                 display_text = display_text[3:].strip()
+                 display_text = display_text[len("系统："):].strip()
             elif display_text.startswith("[系统]"):
-                 display_text = display_text[4:].strip()
-            display_text = u"<b>系统提示：</b><br>" + display_text
+                 display_text = display_text[len("[系统]"):].strip()
+            display_text = "<b>系统提示：</b><br>" + display_text
 
         # Format Markdown trivially to rich text
         display_text = display_text.replace("\n", "<br>")
@@ -825,14 +859,16 @@ QSlider::handle:horizontal {
 
         if text.startswith("你："):
             role = "user"
-            content = text[2:].strip()
+            content = text[len("你："):].strip()
         elif text.startswith("AI："):
             role = "ai"
-            content = text[3:].strip()
+            content = text[len("AI："):].strip()
         
         # Check for weird icon artifacts
-        if content.startswith(u"：") or content.startswith(u"❖："):
-             content = content[2:].strip()
+        for prefix in ["：", "❖："]:
+            if content.startswith(prefix):
+                 content = content[len(prefix):].strip()
+                 break
              
         self._add_chat_bubble(role, content)
 
@@ -864,7 +900,23 @@ QSlider::handle:horizontal {
                     # Send response back to chat
                     msg = u"我选择了: %s" % o
                     self._add_chat_bubble("user", msg)
-                    self._send_text_to_agent(msg)
+                    
+                    # If this was a high-risk plan confirmation, execute it
+                    if self._pending_high_risk_plan:
+                        plan_data, original_text, btns = self._pending_high_risk_plan
+                        self._pending_high_risk_plan = None
+                        if o == u"\u786e\u5b9a\u6267\u884c": # "确定执行"
+                            self._execute_plan(plan_data, original_text)
+                        else: # "取消"
+                            for b in btns:
+                                b.setEnabled(True) # Re-enable plan buttons if cancelled
+                            self.log("[系统] 高风险操作已取消。")
+                            self.sendBtn.setEnabled(True)
+                            self.input.setEnabled(True)
+                            self.input.setFocus()
+                    else:
+                        self._send_text_to_agent(msg)
+                    
                     # Disable buttons to prevent multi-click
                     for i in range(btn_layout.count()):
                         w = btn_layout.itemAt(i).widget()
@@ -897,14 +949,119 @@ QSlider::handle:horizontal {
         self.chatList.addItem(item)
         self.chatList.setItemWidget(item, widget)
         self.chatList.scrollToBottom()
-        self._save_session_history()
+
+    def _add_exec_result_card(self, data):
+        tool_name = data.get("tool", "未知工具")
+        ok = data.get("ok", False)
+        
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(12, 8, 12, 8)
+        
+        bubble = QtWidgets.QFrame()
+        bubble.setObjectName("BubbleSystem")
+        bubble.setMaximumWidth(520)
+        bubble_layout = QtWidgets.QVBoxLayout(bubble)
+        
+        if ok:
+            title_text = u"✅ 执行成功"
+            title_color = "#21C7B7"
+            result = data.get("result", {})
+            summary = result.get("summary", result.get("message", u"操作已完成"))
+            detail_text = str(summary)
+        else:
+            title_text = u"❌ 执行失败"
+            title_color = "#FF5252"
+            err = data.get("error", {})
+            detail_text = err.get("message", u"未知错误")
+
+        title = QtWidgets.QLabel(title_text)
+        title.setStyleSheet("font-weight: bold; color: %s;" % title_color)
+        bubble_layout.addWidget(title)
+        
+        detail = QtWidgets.QLabel(detail_text)
+        detail.setWordWrap(True)
+        detail.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        bubble_layout.addWidget(detail)
+        
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        avatar = QtWidgets.QLabel()
+        avatar.setFixedSize(32, 32)
+        if self._aiAvatar:
+            avatar.setPixmap(self._aiAvatar)
+        row.addWidget(avatar)
+        row.addWidget(bubble)
+        row.addStretch(1)
+        layout.addLayout(row)
+        
+        item = QtWidgets.QListWidgetItem(self.chatList)
+        item.setSizeHint(widget.sizeHint())
+        item.setData(QtCore.Qt.UserRole, "ai")
+        item.setData(QtCore.Qt.UserRole + 1, json.dumps(data))
+        self.chatList.addItem(item)
+        self.chatList.setItemWidget(item, widget)
+        self.chatList.scrollToBottom()
+
+    def _add_error_card(self, error_msg):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(12, 8, 12, 8)
+        
+        bubble = QtWidgets.QFrame()
+        bubble.setObjectName("BubbleSystem")
+        bubble.setMaximumWidth(520)
+        bubble_layout = QtWidgets.QVBoxLayout(bubble)
+        
+        title = QtWidgets.QLabel(u"\u26a0\ufe0f \u7cfb\u7edf\u9519\u8bef / \u4e2d\u65ad")
+        title.setStyleSheet("font-weight: bold; color: #FF5252;")
+        bubble_layout.addWidget(title)
+        
+        detail = QtWidgets.QLabel(error_msg)
+        detail.setWordWrap(True)
+        detail.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        bubble_layout.addWidget(detail)
+        
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        avatar = QtWidgets.QLabel()
+        avatar.setFixedSize(32, 32)
+        if self._aiAvatar:
+            avatar.setPixmap(self._aiAvatar)
+        row.addWidget(avatar)
+        row.addWidget(bubble)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        item = QtWidgets.QListWidgetItem(self.chatList)
+        item.setSizeHint(widget.sizeHint())
+        item.setData(QtCore.Qt.UserRole, "system")
+        item.setData(QtCore.Qt.UserRole + 1, error_msg)
+        self.chatList.addItem(item)
+        self.chatList.setItemWidget(item, widget)
+        self.chatList.scrollToBottom()
+
+    def _save_session_history(self):
+        try:
+            ui_hist = []
+            for i in range(self.chatList.count()):
+                item = self.chatList.item(i)
+                role = item.data(QtCore.Qt.UserRole)
+                content = item.data(QtCore.Qt.UserRole + 1)
+                if role and content:
+                    ui_hist.append({"role": role, "content": content})
+            ChatPersistence.save(ui_hist, self.history)
+        except Exception:
+            pass
 
     def _send_text_to_agent(self, text):
-        from functools import partial
-        self.statusIndicator.setStyleSheet(self._base_style + "background-color: #21C7B7;")
-        cb = partial(self._on_chat_finished)
-        import threading
-        t = threading.Thread(target=partial(self._chat_thread_func, text, self.history))
+        import threading, copy
+        history_copy = copy.deepcopy(self.history)
+        self._add_chat_bubble("ai", "...")
+        self._ai_placeholder_item = self.chatList.item(self.chatList.count() - 1)
+        self.sendBtn.setEnabled(False)
+        self.input.setEnabled(False)
+        t = threading.Thread(target=functools.partial(self._chat_thread_func, text, history_copy))
         t.daemon = True
         t.start()
 
@@ -960,6 +1117,13 @@ QSlider::handle:horizontal {
     def on_mode_changed(self, *_):
         self._ui_to_cfg()
         cfgmod.save_config(self.cfg)
+        mode = self.cfg.get("mode", "auto")
+        if mode == "force_view":
+            self.log(u"[系统] 已切换到 Force Inquiry（强制只读）模式。AI 将不执行任何修改，只读取场景信息。")
+        elif mode == "force_edit":
+            self.log(u"[系统] 已切换到 Force Edit（强制编辑）模式。AI 将直接执行所有操作，跳过 PLAN 卡。")
+        else:
+            self.log(u"[系统] 已切换到 Auto 模式。AI 默认问询并出计划卡，您点《执行》后才会实际修改场景。")
 
     def _on_temp_slider_changed(self, value):
         self.temperatureValue.blockSignals(True)
@@ -1052,14 +1216,14 @@ QSlider::handle:horizontal {
                 if prev_status != status:
                     self.log("[系统] 网关未连接。")
                     if "Bat missing" in status:
-                         self.log("[系统] 错误：找不到启动脚本 (bridge/run_gateway.bat)。\n原因：插件安装目录不完整。\n请尝试重新下载源码包，不要只复制 maya_module。")
+                         self.signals.chat_error.emit("找不到启动脚本 (bridge/run_gateway.bat)。\n原因：插件安装目录不完整。\n请尝试重新下载源码包，不要只复制 maya_module。")
                     elif "No Internet" in status:
-                         self.log("[系统] 错误：无法连接互联网。请检查网络设置。")
+                         self.signals.chat_error.emit("无法连接互联网。请检查网络设置。")
                     elif "Timeout" in status:
-                         self.log("[系统] 错误：网关启动超时。可能是端口 (8765) 被占用，或者 Python 环境问题。")
+                         self.signals.chat_error.emit("网关启动超时。\n可能是端口被占用，或者 Python 环境问题。")
                     elif ":" in status:
                         # 显示其他错误详情
-                        self.log("[系统] 错误详情：%s" % status.split(":", 1)[1].strip())
+                        self.signals.chat_error.emit("网关连接失败：%s" % status.split(":", 1)[1].strip())
             elif status == "Checking...":
                 self.startGatewayBtn.setVisible(False)
 
@@ -1246,8 +1410,23 @@ QSlider::handle:horizontal {
                 return True
         return False
 
+    def on_stop_execution(self):
+        try:
+            from .core.agent_runtime import plan_executor
+            plan_executor.cancel_execution()
+            self.log(u"[系统] 正在停止作业...")
+        except Exception as e:
+            self.log(u"[系统] 停止请求发送失败: %s" % e)
+
     def on_send(self):
-        text = str(self.input.text()).strip()
+        raw_text = self.input.text()
+        # Python 2/3 compat: in Py3, str is already unicode; avoid encode()
+        if not isinstance(raw_text, str):
+            try:
+                raw_text = raw_text.encode("utf-8").decode("utf-8")
+            except Exception:
+                raw_text = str(raw_text)
+        text = raw_text.strip()
         if not text:
             return
         self.input.setText("")
@@ -1259,7 +1438,7 @@ QSlider::handle:horizontal {
 
         # Gateway check
         if not self._gateway_running:
-            self.log("[系统] 网关未连接，请点击上方 'Start Gateway' 按钮。")
+            self.log(u"[系统] 网关未连接，请点击上方 'Start Gateway' 按钮。")
             return
 
         self._ui_to_cfg()
@@ -1270,31 +1449,51 @@ QSlider::handle:horizontal {
         key_field = "gemini_api_key" if provider == "gemini" else "deepseek_api_key"
         if not self.cfg.get(key_field):
             if not self._show_api_key_dialog():
-                self.log("[系统] 未配置 API Key，无法发送消息。")
+                self.log(u"[系统] 未配置 API Key，无法发送消息。")
                 return
 
-        self.log("你：%s" % text)
+        self._add_chat_bubble("user", text)
 
         if not force and not self._is_maya_related(text):
-            self.log("[local] 当前仅处理 Maya/动画相关问题。如需普通提问，请在前面加 !")
+            self._add_chat_bubble("ai", u"当前仅处理 Maya/动画相关问题。如需普通提问，请在前面加 !")
             return
 
         self._add_chat_bubble("ai", "...")
         self._ai_placeholder_item = self.chatList.item(self.chatList.count() - 1)
 
         self.sendBtn.setEnabled(False)
+        self.sendBtn.setVisible(False)
+        self.stopBtn.setVisible(True)
         self.input.setEnabled(False)
 
         import copy
         history_copy = copy.deepcopy(self.history)
 
+        self.signals.status_update.connect(self._on_status_update)
+
         t = threading.Thread(target=functools.partial(self._chat_thread_func, text, history_copy))
         t.daemon = True
         t.start()
 
-    def _chat_thread_func(self, text, history, config_copy=None):
+    def _on_status_update(self, status_text):
+        """Update the placeholder AI bubble text with current processing status."""
+        if self._ai_placeholder_item:
+            widget = self.chatList.itemWidget(self._ai_placeholder_item)
+            if widget:
+                # Find the QLabel inside the bubble widget
+                for label in widget.findChildren(QtWidgets.QLabel):
+                    txt = label.text()
+                    # Update the label that contains our status dots / prev status
+                    if any(kw in txt for kw in ["...", u"\u601d\u8003\u4e2d", u"\u6267\u884c\u4e2d", u"\u5468\u671f"]):
+                        label.setText(status_text)
+                        break
+
+    def _chat_thread_func(self, text, history, execute_plan=None):
+        def _cb(status):
+            self.signals.status_update.emit(status)
         try:
-            reply, new_history = run_chat(text, history_messages=history, max_turns=8)
+            reply, new_history = run_chat(text, history_messages=history, max_turns=8,
+                                          on_status=_cb)
             self.signals.chat_finished.emit(reply, new_history)
         except AgentError as e:
             self.signals.chat_error.emit(str(e))
@@ -1304,20 +1503,236 @@ QSlider::handle:horizontal {
     def on_chat_finished(self, reply, new_history):
         self.history = new_history
         self.sendBtn.setEnabled(True)
+        self.sendBtn.setVisible(True)
+        self.stopBtn.setVisible(False)
         self.input.setEnabled(True)
         self.input.setFocus()
 
         if self._ai_placeholder_item:
-            widget = self.chatList.itemWidget(self._ai_placeholder_item)
-            if widget:
-                label = widget.findChild(QtWidgets.QLabel, "BubbleText")
-                if label:
-                    label.setText(reply)
-                    self._ai_placeholder_item.setSizeHint(widget.sizeHint())
+            row = self.chatList.row(self._ai_placeholder_item)
+            self.chatList.takeItem(row)
             self._ai_placeholder_item = None
+
+        if isinstance(reply, dict):
+            rtype = reply.get("type")
+            if rtype == "text":
+                content = reply.get("content", "")
+                self._add_chat_bubble("ai", content)
+            elif rtype == "confirm":
+                self._add_confirm_card(reply)
+            elif rtype == "exec_result":
+                self._add_exec_result_card(reply)
+                # Smart suggestion follow-up bubble
+                suggestion = reply.get("suggestion", "")
+                if suggestion:
+                    self._add_chat_bubble("ai", suggestion)
+            else:
+                self._add_chat_bubble("ai", str(reply))
         else:
-            self.log("AI：%s" % reply)
+            self._add_chat_bubble("ai", str(reply))
+
         self.chatList.scrollToBottom()
+
+    def _try_parse_plan_block(self, text):
+        """Try to extract [ACTION_PLAN] JSON from text. Returns (plan_data_or_None, remaining_text)."""
+        import re
+        import json as _json
+        pattern = r'\[ACTION_PLAN\]\s*([\s\S]*?)\s*\[/ACTION_PLAN\]'
+        m = re.search(pattern, text)
+        if not m:
+            return None, text
+        json_str = m.group(1).strip()
+        try:
+            plan_data = _json.loads(json_str)
+            remaining = text[:m.start()] + text[m.end():]
+            return plan_data, remaining
+        except Exception:
+            # Graceful degradation: parse failed, show as normal bubble
+            return None, text
+
+    def _set_edit_mode(self, active):
+        """Show/hide the edit mode banner and update running mode."""
+        self.editModeBanner.setVisible(active)
+        if active:
+            self.cfg["mode"] = "force_edit"
+        else:
+            saved = str(self.cfg.get("_user_mode", "auto")).lower()
+            self.cfg["mode"] = saved
+
+    def _add_plan_card(self, plan_data):
+        """Render a PLAN card with Execute / Adjust / Cancel buttons."""
+        risk = plan_data.get("risk", "LOW").upper()
+        risk_color = {"LOW": "#21C7B7", "MED": "#FF9800", "HIGH": "#FF5252"}.get(risk, "#21C7B7")
+        risk_icons = {"LOW": u"\U0001f7e2", "MED": u"\U0001f7e1", "HIGH": u"\U0001f534"}
+        risk_icon = risk_icons.get(risk, u"\U0001f7e2")
+        undoable = plan_data.get("undoable", True)
+        impact = plan_data.get("estimated_impact", {})
+        steps = plan_data.get("steps", [])
+
+        widget = QtWidgets.QWidget()
+        outer = QtWidgets.QHBoxLayout(widget)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
+        avatar = QtWidgets.QLabel()
+        avatar.setFixedSize(32, 32)
+        if self._aiAvatar:
+            avatar.setPixmap(self._aiAvatar)
+        outer.addWidget(avatar)
+
+        bubble = QtWidgets.QFrame()
+        bubble.setMaximumWidth(520)
+        bubble.setStyleSheet(
+            "QFrame { background-color: #0E1F3A; border: 1px solid #2B4B7A; border-radius: 14px; }"
+        )
+        card_layout = QtWidgets.QVBoxLayout(bubble)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(6)
+
+        # Header: goal + risk badge
+        header_row = QtWidgets.QHBoxLayout()
+        plan_icon_lbl = QtWidgets.QLabel(u"\U0001f4cb")
+        plan_icon_lbl.setStyleSheet("font-size: 14px;")
+        header_row.addWidget(plan_icon_lbl)
+        goal_label = QtWidgets.QLabel(u"<b>\u6267\u884c\u8ba1\u5212</b> \u2014 " + plan_data.get("goal", ""))
+        goal_label.setStyleSheet("color: #EAF2FF; font-size: 13px;")
+        goal_label.setWordWrap(True)
+        header_row.addWidget(goal_label, 1)
+        risk_lbl = QtWidgets.QLabel(risk_icon + u" " + risk)
+        risk_lbl.setStyleSheet(
+            "color: %s; font-weight: bold; font-size: 11px; "
+            "padding: 2px 6px; border: 1px solid %s; border-radius: 4px;" % (risk_color, risk_color)
+        )
+        header_row.addWidget(risk_lbl)
+        card_layout.addLayout(header_row)
+
+        # Impact line
+        impact_text = u"\u5c06\u521b\u5efa %d \u4e2a\u8282\u70b9\uff0c\u4fee\u6539 %d\uff0c\u5220\u9664 %d" % (
+            impact.get("create", 0), impact.get("modify", 0), impact.get("delete", 0)
+        )
+        undo_text = u"  \u2714 \u53ef Ctrl+Z \u64a4\u9500" if undoable else u"  \u26a0\ufe0f \u4e0d\u53ef\u64a4\u9500"
+        impact_lbl = QtWidgets.QLabel(impact_text + undo_text)
+        impact_lbl.setStyleSheet("color: #9FB1C7; font-size: 11px;")
+        card_layout.addWidget(impact_lbl)
+
+        # Steps
+        if steps:
+            steps_text = u"\u2022 " + (u"\n\u2022 ".join(steps))
+            steps_lbl = QtWidgets.QLabel(steps_text)
+            steps_lbl.setStyleSheet("color: #7F93AD; font-size: 11px; padding-left: 4px;")
+            steps_lbl.setWordWrap(True)
+            card_layout.addWidget(steps_lbl)
+
+        # Summary
+        summary = plan_data.get("summary", "")
+        if summary:
+            sum_lbl = QtWidgets.QLabel(summary)
+            sum_lbl.setStyleSheet("color: #9FB1C7; font-size: 11px; font-style: italic;")
+            sum_lbl.setWordWrap(True)
+            card_layout.addWidget(sum_lbl)
+
+        # Separator
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setStyleSheet("color: #2B4B7A;")
+        card_layout.addWidget(sep)
+
+        # Buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
+        original_text = plan_data.get("original_user_text", plan_data.get("goal", ""))
+
+        exec_btn = QtWidgets.QPushButton(u"\u25b6 \u6267\u884c")
+        exec_btn.setObjectName("PrimaryButton")
+        exec_btn.setFixedHeight(30)
+        if risk == "MED":
+            exec_btn.setStyleSheet(
+                "background-color: #E65100; color: #FFF; border-radius: 8px; padding: 4px 10px;"
+            )
+            exec_btn.setToolTip(u"\u4e2d\u98ce\u9669\u64cd\u4f5c\uff0c\u786e\u8ba4\u540e\u6267\u884c")
+        elif risk == "HIGH":
+            exec_btn.setStyleSheet(
+                "background-color: #B71C1C; color: #FFF; border-radius: 8px; padding: 4px 10px;"
+            )
+            exec_btn.setToolTip(u"\u9ad8\u98ce\u9669\u64cd\u4f5c\uff0c\u5c06\u5f39\u51fa\u4e8c\u6b21\u786e\u8ba4")
+
+        adjust_btn = QtWidgets.QPushButton(u"\u270e \u8c03\u6574")
+        adjust_btn.setObjectName("SecondaryButton")
+        adjust_btn.setFixedHeight(30)
+        cancel_btn = QtWidgets.QPushButton(u"\u2715 \u53d6\u6d88")
+        cancel_btn.setObjectName("SecondaryButton")
+        cancel_btn.setFixedHeight(30)
+
+        plan_buttons = [exec_btn, adjust_btn, cancel_btn]
+
+        def _on_execute(pd=plan_data, otext=original_text, btns=plan_buttons, r=risk):
+            for b in btns:
+                b.setEnabled(False)
+            if r == "HIGH":
+                self._pending_high_risk_plan = (pd, otext, btns)
+                confirm = {
+                    "type": "confirm",
+                    "action": pd.get("goal", ""),
+                    "target": u"\u9ad8\u98ce\u9669\u64cd\u4f5c",
+                    "options": [u"\u786e\u5b9a\u6267\u884c", u"\u53d6\u6d88"],
+                }
+                self._add_confirm_card(confirm)
+            else:
+                self._execute_plan(pd, otext)
+
+        def _on_adjust(otext=original_text, btns=plan_buttons):
+            self.input.setText(otext + u"\uff08\u8c03\u6574\uff1a")
+            self.input.setFocus()
+            for b in btns:
+                b.setEnabled(False)
+
+        def _on_cancel(btns=plan_buttons):
+            for b in btns:
+                b.setEnabled(False)
+            cancel_btn.setText(u"\u5df2\u53d6\u6d88")
+
+        exec_btn.clicked.connect(_on_execute)
+        adjust_btn.clicked.connect(_on_adjust)
+        cancel_btn.clicked.connect(_on_cancel)
+        btn_row.addWidget(exec_btn)
+        btn_row.addWidget(adjust_btn)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch(1)
+        card_layout.addLayout(btn_row)
+
+        outer.addWidget(bubble)
+        outer.addStretch(1)
+
+        item = QtWidgets.QListWidgetItem(self.chatList)
+        item.setSizeHint(widget.sizeHint())
+        item.setData(QtCore.Qt.UserRole, "ai")
+        item.setData(QtCore.Qt.UserRole + 1, u"[PLAN_CARD]" + plan_data.get("goal", ""))
+        self.chatList.addItem(item)
+        self.chatList.setItemWidget(item, widget)
+        self.chatList.scrollToBottom()
+
+    def _execute_plan(self, plan_data, original_text):
+        """Switch to edit mode and execute the confirmed plan."""
+        self._set_edit_mode(True)
+        self._executing_plan = True
+
+        self._add_chat_bubble("ai", u"...")
+        self._ai_placeholder_item = self.chatList.item(self.chatList.count() - 1)
+        self.sendBtn.setEnabled(False)
+        self.input.setEnabled(False)
+
+        import copy
+        history_copy = copy.deepcopy(self.history)
+        execute_plan_payload = {
+            "plan_id": plan_data.get("plan_id", ""),
+            "original_user_text": original_text,
+            "execute_confirmed": True,
+        }
+        t = threading.Thread(
+            target=functools.partial(self._chat_thread_func, original_text, history_copy, execute_plan_payload)
+        )
+        t.daemon = True
+        t.start()
 
     def on_chat_error(self, error):
         self.sendBtn.setEnabled(True)
@@ -1325,16 +1740,11 @@ QSlider::handle:horizontal {
         self.input.setFocus()
 
         if self._ai_placeholder_item:
-            widget = self.chatList.itemWidget(self._ai_placeholder_item)
-            if widget:
-                label = widget.findChild(QtWidgets.QLabel, "BubbleText")
-                if label:
-                    label.setText("[Error] " + error)
-                    label.setStyleSheet("color: #FF5252;")
-                    self._ai_placeholder_item.setSizeHint(widget.sizeHint())
+            row = self.chatList.row(self._ai_placeholder_item)
+            self.chatList.takeItem(row)
             self._ai_placeholder_item = None
-        else:
-            self.log("[Error] %s" % error)
+            
+        self._add_error_card(str(error))
         self.chatList.scrollToBottom()
 
     def _is_maya_related(self, text):

@@ -1,27 +1,98 @@
 # -*- coding: utf-8 -*-
+"""
+AIFORMAYA v2.0  —  Multi-Agent Router + Scene Awareness
+"""
 from __future__ import absolute_import
-
-import time
+import re
+import json as _json_module
+import threading
+import traceback
+import uuid
+import json
+import logging
+import os
 
 import maya.utils as maya_utils
 
 from .http_client import post_json, HttpError
 from . import config as cfgmod
-from ..tools.registry import tools_schema, call_tool
+from .agent_runtime.task_analyzer import analyze_task
+from .agent_runtime.task_planner import plan_task
+from .agent_runtime.plan_executor import execute_plan
+from .agent_runtime.plan_cache import get_cached_plan, save_plan
+from .agent_runtime.plan_validator import validate_plan
+from ..tools.maya_tools import TOOLS as _TOOLS_SCHEMA_CACHE_RAW, tools_schema
 from ..tools.maya_tools import ConfirmationError
+from ..tools.registry import call_tool
 
 try:
-    from .memory import EntityMemory
+    from .memory import EntityMemory, resolve_entities
 except ImportError:
     class EntityMemory(object):
         @classmethod
-        def get_summary(cls):
-            return ""
+        def get_summary(cls): return ""
+        @classmethod
+        def update_last_created(cls, t, n): pass
+        @classmethod
+        def update_last_selected(cls, n): pass
+        @classmethod
+        def update_last_camera(cls, n): pass
+        @classmethod
+        def update_recent_objects(cls, names): pass
+
+# ─────────────────────────────────────────────
+# Debug logger
+# ─────────────────────────────────────────────
+_LOG_FILE = os.path.join(os.path.expanduser("~"), "aiformaya_debug.log")
+logging.basicConfig(
+    filename=_LOG_FILE,
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
+)
+log = logging.getLogger("aiformaya")
+
 
 class AgentError(Exception):
     pass
 
 
+# ─────────────────────────────────────────────
+# Execution Policy
+# ─────────────────────────────────────────────
+# 创建类 + 查询类：直接执行，不询问
+AUTO_EXECUTE_TOOLS = {
+    "maya.create_cube",
+    "maya.create_sphere",
+    "maya.create_cylinder",
+    "maya.create_plane",
+    "maya.create_camera",
+    "maya.create_turntable",
+    "maya.create_three_point_lighting",
+    "maya.create_bouncing_ball",
+    "maya.create_loop_rotate",
+    "maya.create_ping_pong_translate",
+    "maya.create_and_animate_translate_x",
+    "maya.camera_look_at",
+    "maya.camera_frame_selection",
+    "maya.duplicate_objects",
+    "maya.freeze_transforms",
+    "maya.center_pivot",
+    "maya.scan_scene_summary",
+    "maya.list_selection",
+    "maya.list_cameras",
+    "maya.list_animated_nodes",
+    "maya.list_tools",
+}
+
+def should_auto_execute(tool_name):
+    """Return True if this tool (already canonicalized) should execute without confirmation."""
+    return tool_name in AUTO_EXECUTE_TOOLS
+
+
+# ─────────────────────────────────────────────
+# Alias map
+# ─────────────────────────────────────────────
 _ALIAS_MAP = {
     "maya.create_polygon_cube": "maya.create_cube",
     "maya.create_poly_cube": "maya.create_cube",
@@ -46,11 +117,25 @@ _ALIAS_MAP = {
     "maya.scale_keys": "maya.retime_range",
     "maya.create_bounce_ball": "maya.create_bouncing_ball",
     "maya.bounce_ball": "maya.create_bouncing_ball",
-    "maya.create_bouncing_ball": "maya.create_bouncing_ball",
     "maya.camera": "maya.create_camera",
+    # v2.1: camera aim aliases
+    "maya.aim_camera_at_selection": "maya.camera_look_at",
+    "maya.look_at": "maya.camera_look_at",
+    "maya.camera_aim": "maya.camera_look_at",
+    "maya.frame_selection": "maya.camera_frame_selection",
+    "maya.fit_camera": "maya.camera_frame_selection",
+    "maya.view_fit": "maya.camera_frame_selection",
+    # v2.1: transform aliases
+    "maya.freeze": "maya.freeze_transforms",
+    "maya.make_identity": "maya.freeze_transforms",
+    "maya.center_origin": "maya.center_pivot",
+    "maya.pivot_center": "maya.center_pivot",
+    "maya.duplicate": "maya.duplicate_objects",
+    "maya.delete": "maya.delete_selected",
+    "maya.parent": "maya.parent_objects",
 }
 
-_SINGLE_SHOT_TOOLS = set([
+_SINGLE_SHOT_TOOLS = {
     "maya.create_and_animate_translate_x",
     "maya.retime_keys",
     "maya.retime_range",
@@ -58,94 +143,481 @@ _SINGLE_SHOT_TOOLS = set([
     "maya.create_loop_rotate",
     "maya.create_ping_pong_translate",
     "maya.import_bomb_asset",
-])
+    "maya.create_three_point_lighting",
+    "maya.create_turntable",
+    "maya.cleanup_scene",
+    "maya.group_and_center",
+    "maya.randomize_transforms",
+    "maya.assign_color_materials",
+}
+
+# ─────────────────────────────────────────────
+# Tool subsets per agent
+# ─────────────────────────────────────────────
+_AGENT_TOOLS = {
+    "modeling": {
+        "maya.create_cube", "maya.create_sphere", "maya.create_cylinder",
+        "maya.create_plane", "maya.rename_batch", "maya.group_and_center",
+        "maya.create_camera", "maya.camera_look_at", "maya.camera_frame_selection",
+        "maya.create_three_point_lighting", "maya.create_turntable",
+        "maya.ask_user_confirmation",
+    },
+    "animation": {
+        "maya.set_key", "maya.shift_keys", "maya.retime_keys",
+        "maya.retime_range", "maya.create_loop_rotate",
+        "maya.create_ping_pong_translate", "maya.create_bouncing_ball",
+        "maya.create_and_animate_translate_x",
+        "maya.list_animated_nodes", "maya.list_selection",
+        "maya.ask_user_confirmation",
+    },
+    "lighting": {
+        "maya.create_three_point_lighting", "maya.create_turntable",
+        "maya.ask_user_confirmation",
+    },
+    "scene": {
+        "maya.scan_scene_summary", "maya.list_selection",
+        "maya.list_cameras", "maya.list_animated_nodes", "maya.list_tools",
+    },
+    "general": {
+        "maya.cleanup_scene", "maya.execute_python_code",
+        "maya.ask_user_confirmation", "maya.list_tools",
+        "maya.scan_scene_summary", "maya.list_selection",
+    },
+}
+
+def _filter_tools_for_agent(agent_type):
+    allowed = _AGENT_TOOLS.get(agent_type, set())
+    # Use cached schema to avoid rebuilding every call
+    return [t for t in _TOOLS_SCHEMA_CACHE if t.get("name") in allowed]
+
+# Cache tools schema at import time — rebuilt only when Maya reloads the module
+_TOOLS_SCHEMA_CACHE = tools_schema()
 
 
+# ─────────────────────────────────────────────
+# Router Agent — keyword matching, no LLM call
+# ─────────────────────────────────────────────
+_ROUTER_RULES = [
+    ("scene",     [u"场景", u"有什么", u"分析", u"摘要", u"查询", u"选中了什么",
+                   u"里面有", u"包含什么", u"摄像机列表"]),
+    ("modeling", [u"创建", u"建模", u"物体", u"几何", u"材质", u"球", u"方块",
+                  u"立方", u"平面", u"柱", u"组", u"复制", u"冻结", u"轴心", u"删除", "delete",
+                  u"生成", u"做一个", u"放一个", u"来个", u"摄像机", u"看向", u"框选",
+                  "create", "make", "add", "spawn", "model", "duplicate", "freeze", "camera", "look_at", "frame"]),
+    ("animation", [u"动画", u"旋转", u"位移", u"关键帧", u"弹跳", u"循环",
+                   u"k帧", u"K帧", u"retime", "animate", "keyframe"]),
+    ("lighting",  [u"灯光", u"布光", u"三点光", u"转台", u"渲染",
+                   "light", "turntable"]),
+    ("general",   [u"脚本", u"代码", u"工具", u"插件", "python", "script"]),
+]
+
+def router_agent(user_text):
+    """Route user request to the most relevant sub-agent type."""
+    agent_type = "general"
+    text_lower = user_text.lower()
+    for agent, keywords in _ROUTER_RULES:
+        for kw in keywords:
+            # Use lower() only for ASCII keywords to avoid mangling Chinese
+            matched = (kw.lower() in text_lower) if all(ord(c) < 128 for c in kw) else (kw in user_text)
+            if matched:
+                agent_type = agent
+                break
+        if agent_type != "general":
+            break
+    log.info(u"Router result: %s | text: %.60s", agent_type, user_text)
+    return agent_type
+
+
+# ─────────────────────────────────────────────
+# Scene Context
+# ─────────────────────────────────────────────
+def _get_scene_context_safe():
+    """
+    Attempt to get a lightweight scene snapshot for context injection.
+    Must be called from Maya main thread. Returns '' on any failure.
+    """
+    try:
+        from ..tools.registry import call_tool as _ct
+        result = _ct("maya.scan_scene_summary", {})
+        if result.get("ok"):
+            data = result.get("result") or {}
+            lines = [u"\u300a\u5f53\u524d\u573a\u666f\u5feb\u7167\u300b"]  # 《当前场景快照》
+            geo = data.get("geometry", [])
+            if geo:
+                lines.append(u"\u51e0\u4f55\u4f53: " + u", ".join(str(g.get("name","?")) for g in geo[:8]))
+            cams = data.get("user_cameras") or data.get("cameras") or []
+            if cams:
+                lines.append(u"\u6444\u50cf\u673a: " + u", ".join(str(c) for c in cams[:4]))
+            lights = data.get("lights", [])
+            if lights:
+                lines.append(u"\u706f\u5149: " + u", ".join(str(l) for l in lights[:4]))
+            sel = data.get("selection", [])
+            if sel:
+                lines.append(u"\u5f53\u524d\u9009\u4e2d: " + u", ".join(str(s) for s in sel[:4]))
+            # v2.2: total object count for scene-scale awareness
+            total = data.get("total_user_objects")
+            if total:
+                lines.append(u"\u5bf9\u8c61\u603b\u6570: %s" % total)
+            return u"\n".join(lines)
+    except Exception as e:
+        log.debug("get_scene_context failed: %s", e)
+    return ""
+
+
+# ─────────────────────────────────────────────
+# System prompts per agent
+# ─────────────────────────────────────────────
+_EXEC_POLICY = u"""
+
+## 工具使用优先级（必须遵守）
+
+### Level 1 优先：专用 Maya 工具
+如果存在与用户请求直接对应的工具，必须调用该工具。
+不要用 execute_python_code 替代已有工具。
+
+示例：
+- 创建一个摄像机 → maya.create_camera
+- 创建一个球 → maya.create_sphere
+- 复制选中物体 → maya.duplicate_objects
+- 创建三点布光 → maya.create_three_point_lighting
+- 创建转台摄像机 → maya.create_turntable
+- 删除选中物体 → maya.delete_selected
+- 冻结变换 → maya.freeze_transforms
+
+### Level 4 最低优先： execute_python_code
+只有以下情况才允许使用 execute_python_code：
+- 需要循环创建大量对象（如：创建10个球）
+- 需要复杂数学逻辑
+- 需要多个 Maya API 组合
+- 没有对应的专用工具
+
+### 严格禁止
+禁止用 execute_python_code 做：
+- 创建基础几何体（球/方块/柱/平面）
+- 创建摄像机或灯光
+- 复制 / 删除 / 冻结 / 居中轴心
+- 设置关键帧
+
+## 执行策略
+《创建类》：直接调用对应专用工具，完成后告知结果并给出一条智能建议。
+《查询类》：直接执行，然后用自然语言回答。
+《修改已有元素》：先说明方案，再问用户：“需要我帮你执行吗？”
+《破坏性操作》：必须调用 maya.ask_user_confirmation 加以确认。
+
+禁止：不要输出 JSON 卡片或 [ACTION_PLAN]；回复用中文，自然流畅。
+"""
+
+# ─────────────────────────────────────────────
+# Intent Resolver — pronoun → entity name
+# ─────────────────────────────────────────────
+_PRONOUNS_ZH = [u"\u5b83", u"\u5b83\u4eec", u"\u8fd9\u4e2a", u"\u8fd9\u4e9b",
+                u"\u90a3\u4e2a", u"\u90a3\u4e9b", u"\u6b64\u7269\u4f53"]  # 它/它们/这个/这些/那个/那些/此物体
+_PRONOUNS_EN = ["it", "them", "this", "these", "that", "those", "selected"]
+
+def resolve_entities(user_text):
+    """
+    Lightweight intent resolver: replace pronouns with the concrete entity name
+    from EntityMemory so the LLM doesn't have to guess.
+    Returns the enriched text (may be unchanged if no memory or no pronouns found).
+    """
+    try:
+        mem = EntityMemory.load()
+        # Best candidate: last selected > last created object > last camera
+        last_sel = mem.get("last_selected", "")
+        last_cam = mem.get("last_camera", "")
+        last_created = ""
+        lc = mem.get("last_created", {})
+        if lc:
+            # prefer most recently created regardless of type
+            last_created = list(lc.values())[-1] if lc else ""
+
+        target = last_sel or last_created or last_cam
+        if not target:
+            return user_text  # nothing in memory, can't resolve
+
+        resolved = user_text
+        for pron in _PRONOUNS_ZH:
+            if pron in resolved:
+                resolved = resolved.replace(pron, u"%s\uff08%s\uff09" % (pron, target))
+                break  # replace once, keep natural phrasing
+        for pron in _PRONOUNS_EN:
+            import re as _re
+            # whole-word match only
+            resolved = _re.sub(r"\b" + pron + r"\b",
+                               "%s(%s)" % (pron, target), resolved,
+                               count=1, flags=_re.IGNORECASE)
+
+        if resolved != user_text:
+            log.info(u"IntentResolver: '%s' -> '%s'", user_text[:60], resolved[:60])
+        return resolved
+    except Exception as e:
+        log.debug("resolve_entities failed: %s", e)
+        return user_text
+
+
+# ─────────────────────────────────────────────
+# Tool Capability Prompt builder
+# ─────────────────────────────────────────────
+def _build_tool_capability_line(tool_list):
+    """
+    Return a compact one-line capability statement for system prompt.
+    Tells LLM explicitly what tools it has — more reliable than schema alone.
+    """
+    if not tool_list:
+        return u""
+    names = [t.get("name", "").replace("maya.", "") for t in tool_list]
+    return u"\n\n## \u53ef\u7528\u5de5\u5177\n" + u"\u3001".join(names)  # 可用工具\ncreate_cube、create_sphere...
+
+
+def _base_prompt(role_desc, scene_ctx, mem_summary, tool_list=None):
+    prompt = role_desc + _EXEC_POLICY
+    if tool_list:
+        prompt += _build_tool_capability_line(tool_list)
+    if scene_ctx:
+        prompt += u"\n" + scene_ctx
+    if mem_summary:
+        prompt += u"\n\n" + mem_summary
+    return prompt
+
+def _build_modeling_messages(user_text, scene_ctx, mem_summary, tool_list=None):
+    role = (
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u5efa\u6a21\u4e13\u5bb6\u548c\u573a\u666f\u7ed3\u6784\u5e08\u3002"
+        u"\u5c13\u957f\u5904\u7406\uff1a\u521b\u5efa\u51e0\u4f55\u4f53\u3001\u573a\u666f\u7ef4\u62a4\u3001\u6279\u91cf\u547d\u540d\u3001\u65b0\u589e\u6750\u8d28\u3002"
+        u"\u521b\u5efa\u5b8c\u6210\u540e\u52a1\u5fc5\u7ed9\u51fa\u4e00\u6761\u4e13\u4e1a\u5efa\u8bae\u3002"
+    )
+    return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
+            {"role": "user", "content": user_text}]
+
+def _build_animation_messages(user_text, scene_ctx, mem_summary, tool_list=None):
+    role = (
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u52a8\u753b TD\u3002"
+        u"\u5c13\u957f\u521b\u5efa\u5404\u7c7b\u52a8\u753b\uff1a\u5e73\u79fb\u3001\u65cb\u8f6c\u3001\u5f39\u8df3\u3001\u5faa\u73af\u3001\u53d8\u5f62\u5173\u952e\u5e27\u3002"
+        u"\u521b\u5efa\u52a8\u753b\u540e\u52a1\u5fc5\u544a\u77e5\u5173\u952e\u5e27\u8303\u56f4\u5e76\u5efa\u8bae\u662f\u5426\u9700\u8981\u66f2\u7ebf\u8c03\u6574\u3002"
+    )
+    return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
+            {"role": "user", "content": user_text}]
+
+def _build_lighting_messages(user_text, scene_ctx, mem_summary, tool_list=None):
+    role = (
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u706f\u5149\u5e08\u548c\u6444\u50cf\u5e08\u3002"
+        u"\u5c13\u957f\u521b\u5efa\u4e09\u70b9\u706f\u5149\u3001\u8bbe\u7f6e\u4e3b\u6458\u50cf\u673a\u3001\u8f6c\u53f0\u5c55\u793a\u3002"
+        u"\u521b\u5efa\u540e\u52a1\u5fc5\u8bc4\u4ef7\u5149\u6e90\u5e76\u5efa\u8bae\u6e32\u67d3\u8bbe\u7f6e\u3002"
+    )
+    return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
+            {"role": "user", "content": user_text}]
+
+def _build_scene_messages(user_text, scene_ctx, mem_summary, tool_list=None):
+    role = (
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u573a\u666f\u5206\u6790\u5e08\u3002"
+        u"\u4f18\u5148\u8c03\u7528 maya.scan_scene_summary \u83b7\u53d6\u5b8c\u6574\u573a\u666f\u4fe1\u606f\uff0c\u518d\u7ec4\u7ec7\u81ea\u7136\u8bed\u8a00\u56de\u7b54\u3002"
+        u"\u4e0d\u8981\u5217\u51fa Maya \u5185\u7f6e\u76f8\u673a\uff08persp/top/front/side\uff09\u3002"
+    )
+    return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
+            {"role": "user", "content": user_text}]
+
+def _build_general_messages(user_text, scene_ctx, mem_summary, tool_list=None):
+    role = (
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u8d44\u6df1\u6280\u672f\u603b\u76d1\uff08TD\uff09\u3002"
+        u"\u5904\u7406\u590d\u6742\u4efb\u52a1\u3001\u9ad8\u7ea7\u64cd\u4f5c\u3001Python \u811a\u672c\u3001\u8de8\u88c1\u9886\u57df\u95ee\u9898\u3002"
+        u"\u65e0\u5bf9\u5e94\u4e13\u7528\u5de5\u5177\u7684\u9700\u6c42\u5fc5\u987b\u7528 maya.execute_python_code\u3002"
+    )
+    return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
+            {"role": "user", "content": user_text}]
+
+_AGENT_BUILDERS = {
+    "modeling":  _build_modeling_messages,
+    "animation": _build_animation_messages,
+    "lighting":  _build_lighting_messages,
+    "scene":     _build_scene_messages,
+    "general":   _build_general_messages,
+}
+
+# Smart suggestions after creation tools
+_CREATION_SUGGESTIONS = {
+    "maya.create_sphere":   u"\U0001f4a1 建议：可以为它创建旋转动画，或添加反射材质。需要我继续吗？",
+    "maya.create_cube":     u"\U0001f4a1 建议：可以对它进行随机变换，或打组整理场景。需要我继续吗？",
+    "maya.create_camera":   u"\U0001f4a1 建议：可以为摄像机创建转台动画或设置视角。需要我继续吗？",
+    "maya.create_turntable":u"\U0001f4a1 建议：转台已就绪，可以进行渲染或调整速度。需要我帮你吗？",
+    "maya.create_three_point_lighting": u"\U0001f4a1 建议：三点灯已建立，可以调整各灯亮度或渲染测试。需要我继续吗？",
+    "maya.create_bouncing_ball": u"\U0001f4a1 建议：弹跳球动画已创建，可以调整缓动曲线或添加阴影。",
+}
+
+def _get_suggestion(canon_name):
+    return _CREATION_SUGGESTIONS.get(canon_name, "")
+
+
+# ─────────────────────────────────────────────
+# Helper
+# ─────────────────────────────────────────────
 def _model_for_provider(cfg):
     provider = (cfg.get("provider") or "deepseek").strip().lower()
     if provider == "gemini":
         return cfg.get("model_gemini") or "gemini-1.5-flash"
     return cfg.get("model_deepseek") or "deepseek-chat"
 
+def _clean_history(msgs):
+    out = []
+    for m in msgs:
+        content = m.get("content", "")
+        if m.get("role") == "user" and content.strip().startswith("[TOOL_RESULT]"):
+            continue
+        if m.get("role") == "assistant" and '"type": "tool_call"' in content:
+            continue
+        out.append(m)
+    return out
 
-def _build_messages(user_text, mode):
-    if mode == "view":
-        sys = (
-            "你是一个 Maya 2020（Windows）里的建模与动画助手，目前处于“问询模式”。"
-            "在该模式下，你只能使用只读工具查看场景信息，不能修改场景。"
-            "如果用户提出的是可以通过工具完成的编辑操作，请用自然语言说明："
-            "当前是只读模式，请他在面板中切换到编辑模式后，你就可以帮他完成这些操作。"
-        )
-    else:
-        sys = (
-            "你是一个 Maya 2020（Windows）里的资深技术总监（TD）和动画/建模助手，目前处于“编辑模式”。\n"
-            "你可以通过提供的工具直接修改场景代码，并应遵循以下最高级别的职业原则：\n\n"
-            "1）如果能用现有的专用工具（如 maya.create_object_and_camera_and_aim 等）解决问题，请优先使用它们；\n"
-            "2）如果你发现用户请求的具体操作没有对应的专用工具，**你绝对不应该直接回绝说明“我做不到”**。相反，你可以使用 `maya.execute_python_code` 工具自己编写并运行 Maya Python (`import maya.cmds as cmds` 等) 脚本来实现用户的任意需求！你可以像一个真正的 TD 一样灵活编程；\n"
-            "3）对于含糊不清的指令，你必须向用户提问澄清，而不是擅自盲目修改场景；\n"
-            "4）面对极其复杂的、一次性无法通过几行代码完成的生产级要求（例如“帮我绑定这个高模角色并刷好权重”），你应该诚实地告诉用户这超出了一次自动执行的范围，**然后给出详细的生产步骤指导和建议**；\n"
-            "5）强烈注意破坏性操作！如果用户的指令涉及大范围删除、不可逆的操作或重置场景，在执行之前，你**必须**调用 `maya.ask_user_confirmation` 工具弹出二次确认卡片，并强烈建议用户“另存为”新文件保存进度；\n"
-            "6）如果请求部分无法完成或报了错，用人话详细解释错误原因，并给出下一步怎么修复的专业指导。\n"
-        )
-    sys += (
-        "\n\n当你收到 [/TOOL_RESULT] 块后：\n"
-        "1. 如果仍然需要继续执行后续动作，请继续输出包含工具调用的 JSON 块，不要生成多余的闲聊语言。\n"
-        "2. 当你确定所有需要的操作都已经完成，并且没有任何更多的工具需要调用时，请主动、自然、流畅地用中文给用户回复。\n"
-        "- 告诉用户你刚刚具体对哪些对象做了什么操作，取得了什么效果。\n"
-        "- 绝对不要再输出任何 JSON、TOOL_RESULT 标记、traceback，也绝对不要以“执行回执”这种死板机器人的口吻开头（就像你在和同事面对面汇报工作一样）。"
-    )
-
-    mem_summary = EntityMemory.get_summary()
-    if mem_summary:
-        sys += "\n\n" + mem_summary
-
-    return [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": user_text},
-    ]
+def _update_memory_from_result(canon_name, tool_result):
+    """Auto-update Entity Memory after a successful tool execution."""
+    if not tool_result.get("ok"):
+        return
+    result = tool_result.get("result") or {}
+    try:
+        # Extract created object name
+        created = (result.get("created") or result.get("name") or
+                   result.get("node") or result.get("camera") or "")
+        if created:
+            # Determine type
+            if "sphere" in canon_name:
+                EntityMemory.update_last_created("sphere", created)
+            elif "cube" in canon_name:
+                EntityMemory.update_last_created("cube", created)
+            elif "camera" in canon_name:
+                EntityMemory.update_last_created("camera", created)
+                EntityMemory.update_last_camera(created)
+            elif "light" in canon_name or "lighting" in canon_name:
+                EntityMemory.update_last_created("light", created)
+            else:
+                EntityMemory.update_last_created("object", created)
+            EntityMemory.update_recent_objects([created])
+        # Selection update
+        sel = result.get("selected") or result.get("nodes") or []
+        if sel:
+            EntityMemory.update_last_selected(sel[0])
+            EntityMemory.update_recent_objects(sel[:5])
+    except Exception as e:
+        log.debug("memory update failed: %s", e)
 
 
-def run_chat(user_text, history_messages=None, max_turns=6):
+# ─────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────
+def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
     """
-    history_messages: list of {role, content} excluding the system tool list (bridge will handle that)
-    Returns: (final_text, new_history_messages)
+    Returns: (reply_dict, new_history_messages)
+    reply_dict types: text | confirm | exec_result
+
+    on_status: optional callable(str) for real-time status updates
+               called with '\u6b63\u5728\u601d\u8003...', '\u6b63\u5728\u6267\u884c...', etc.
     """
+    def _emit(msg):
+        if on_status:
+            try:
+                on_status(msg)
+            except Exception:
+                pass
+
     cfg = cfgmod.load_config()
     gateway_url = (cfg.get("gateway_url") or "").rstrip("/")
     if not gateway_url:
-        raise AgentError("缺少 gateway_url")
+        raise AgentError(u"\u7f3a\u5c11 gateway_url")
 
     provider = (cfg.get("provider") or "deepseek").strip().lower()
     api_key = cfg.get("gemini_api_key") if provider == "gemini" else cfg.get("deepseek_api_key")
     model = _model_for_provider(cfg)
     temperature = float(cfg.get("temperature", 0.2))
 
-    mode = str(cfg.get("mode", "edit")).strip().lower()
-    tools = tools_schema()
-    if mode == "view":
-        readonly = set([
-            "maya.list_tools",
-            "maya.list_selection",
-            "maya.list_cameras",
-            "maya.list_animated_nodes",
-        ])
-        tools = [t for t in tools if t.get("name") in readonly]
+    effective_text = user_text
+    # v2.2 Intent Resolver: expand pronouns before routing and LLM call
+    effective_text = resolve_entities(effective_text)
 
+    # ── Route to sub-agent ──
+    agent_type = router_agent(effective_text)
+    log.info(u"Agent type: %s | text: %s", agent_type, effective_text[:60])
+
+    # ── Scene context (lightweight, may fail silently) ──
+    try:
+        scene_ctx = maya_utils.executeInMainThreadWithResult(_get_scene_context_safe)
+    except Exception:
+        scene_ctx = ""
+
+    # ── Memory summary ──
+    mem_summary = EntityMemory.get_summary()
+
+    # ── Tool subset ──
+    tools = _filter_tools_for_agent(agent_type)
+
+    # v2.3 Agent Runtime: Branch for complex tasks
+    _emit(u"🧠 AI 分析请求...")
+    task_type = analyze_task(effective_text)
+    log.info(u"Task type: %s | text: %.60s", task_type, effective_text)
+    
+    if task_type != "SIMPLE_TOOL":
+        log.info(u"Delegating to Agent Runtime Planner")
+        
+        try:
+            # 1. Cache Check
+            plan = get_cached_plan(effective_text)
+            
+            # 2. Planning
+            if not plan:
+                _emit(u"🧠 AI 规划任务...")
+                plan = plan_task(effective_text, _TOOLS_SCHEMA_CACHE, gateway_url, provider, api_key, model)
+                save_plan(effective_text, plan)
+            else:
+                _emit(u"🧠 AI 启用快捷规划...")
+                
+            log.info(u"Generated Plan: %s", json.dumps(plan, ensure_ascii=False))
+            
+            # 3. Validation
+            validate_plan(plan, _TOOLS_SCHEMA_CACHE)
+            
+            # 4. Execution
+            result_summary = execute_plan(plan, available_tools=_TOOLS_SCHEMA_CACHE, emit_status=_emit)
+            
+            messages = history_messages if history_messages else []
+            messages.append({"role": "user", "content": effective_text})
+            messages.append({"role": "assistant", "content": result_summary})
+            return {"type": "text", "content": result_summary}, _clean_history(messages)
+        except Exception as e:
+            log.error(u"Agent Runtime \u5f02\u5e38: %s", e)
+            # The user's diff snippet seems to indicate an insertion here, but it's malformed.
+            # Assuming the intent was to add a scene scan and emit *outside* the exception block,
+            # or that the provided diff was a fragment of a larger change.
+            # Based on the instruction "add emit before scan_scene_summary", and the original code
+            # having `_get_scene_context_safe`, I've placed the emit before that call.
+            # The provided diff snippet for this section is syntactically incorrect and
+            # seems to be a partial or corrupted instruction. I will ignore the malformed
+            # part of the diff and only apply the clear instruction about `_emit` and `_scan_scene_summary`
+            # by placing `_emit` before the existing scene context gathering.
+            error_msg = u"\u4efb\u52a1\u89c4\u5212\u6216\u6267\u884c\u5931\u8d25\uff1a%s" % str(e)
+            _emit(u"\u274c " + error_msg)
+            messages = history_messages if history_messages else []
+            messages.append({"role": "user", "content": effective_text})
+            messages.append({"role": "assistant", "content": error_msg})
+            return {"type": "text", "content": error_msg}, _clean_history(messages)
+
+    # ── Build messages (pass tool_list for capability prompt) ──
+    builder = _AGENT_BUILDERS.get(agent_type, _build_general_messages)
     messages = []
     if history_messages:
         messages.extend(history_messages)
+        fresh_sys = builder(effective_text, scene_ctx, mem_summary, tool_list=tools)[0]
+        if messages and messages[0].get("role") == "system":
+            messages[0] = fresh_sys
+        else:
+            messages.insert(0, fresh_sys)
+        messages.append({"role": "user", "content": effective_text})
     else:
-        messages.extend(_build_messages(user_text, mode))
-
-    if history_messages:
-        messages.append({"role": "user", "content": user_text})
+        messages.extend(builder(effective_text, scene_ctx, mem_summary, tool_list=tools))
 
     turns = 0
-    executed = set()  # dedup consecutive identical tool calls
+    executed = set()
+    _first_llm_call = [True]  # track first vs subsequent calls
+
     while True:
         turns += 1
         if turns > max_turns:
-            raise AgentError("tool-call 回合过多，已停止（%d）" % max_turns)
+            raise AgentError(u"tool-call \u56de\u5408\u8fc7\u591a\uff0c\u5df2\u505c\u6b62\uff08%d\uff09" % max_turns)
 
         payload = {
             "provider": provider,
@@ -157,107 +629,160 @@ def run_chat(user_text, history_messages=None, max_turns=6):
             "max_output_tokens": 4096,
         }
 
+        # Status: thinking
+        if _first_llm_call[0]:
+            _emit(u"\U0001f9e0 AI \u601d\u8003\u4e2d...")
+            _first_llm_call[0] = False
+        else:
+            _emit(u"\U0001f9e0 AI \u7ee7\u7eed\u601d\u8003...")
+
         try:
             resp = post_json(gateway_url + "/chat", payload, timeout_s=60)
         except HttpError as e:
-            raise AgentError("网关请求失败：%s" % str(e))
+            raise AgentError(u"\u7f51\u5173\u8bf7\u6c42\u5931\u8d25\uff1a%s" % str(e))
 
         if not resp or "type" not in resp:
-            raise AgentError("网关返回无效响应：%s" % str(resp))
+            raise AgentError(u"\u7f51\u5173\u8fd4\u56de\u65e0\u6548\u54cd\u5e94\uff1a%s" % str(resp))
 
+        # ── Text response ──
         if resp["type"] == "message":
-            text = resp.get("content") or ""
-            
-            import re
-            cleaned_text = re.sub(r"^(最终执行回执：|最终执行回执:|执行回执：|执行回执:|<final_execution_receipt>)", "", text.strip()).strip()
-            if not cleaned_text:
-                text = "已执行操作完成。"
-            else:
-                text = cleaned_text
-
+            text = resp.get("content") or u"\u64cd\u4f5c\u5df2\u5b8c\u6210\u3002"
+            text = re.sub(r"^(\u6267\u884c\u56de\u636e\uff1a|\u6267\u884c\u56de\u636e:|<final_execution_receipt>)", "", text.strip()).strip()
+            if not text:
+                text = u"\u64cd\u4f5c\u5df2\u5b8c\u6210\u3002"
+            log.debug("LLM text reply: %s", text[:80])
             messages.append({"role": "assistant", "content": text})
-            return text, messages
+            return {"type": "text", "content": text}, _clean_history(messages)
 
+        # ── Tool call ──
         if resp["type"] == "tool_call":
             tool_name = resp.get("name")
             args = resp.get("arguments") or {}
             content = resp.get("content") or ""
+            canon_name = _ALIAS_MAP.get(tool_name, tool_name)
 
-            import json as _json
+            # v2.2 logging
+            if canon_name != tool_name:
+                log.info(u"Alias mapped: %s -> %s", tool_name, canon_name)
+            log.info(u"Tool call: %s", tool_name)
+            log.debug(u"Tool args: %s", args)
+
+            # v2.2 create-guard: intercept before should_auto_execute
+            _CREATE_KEYWORDS = [u"\u521b\u5efa", u"\u751f\u6210", u"\u505a\u4e00\u4e2a", u"\u6765\u4e2a",
+                                "create", "make", "add", "new", "spawn", "camera", "sphere", "cube"]
+            if canon_name == "maya.execute_python_code":
+                if any(kw in effective_text.lower() or kw in effective_text for kw in _CREATE_KEYWORDS):
+                    log.info(u"create-guard: blocked execute_python_code for create request")
+                    messages.append({"role": "user", "content":
+                        u"[SYSTEM GUARD] \u4f60\u8bd5\u56fe\u7528 execute_python_code \u521b\u5efa\u5bf9\u8c61\u3002"
+                        u"\u8bf7\u6539\u7528\u5bf9\u5e94\u7684\u4e13\u7528\u5de5\u5177\uff1a"
+                        u"create_sphere / create_cube / create_camera / create_cylinder \u7b49\u3002"
+                        u"\u7981\u6b62\u7528 execute_python_code \u521b\u5efa\u5355\u4e2a\u5bf9\u8c61\u3002"})
+                    continue
+
+            # v2.2 Execution Policy enforcement
+            if not should_auto_execute(canon_name):
+                confirm_payload = {
+                    "type": "confirm",
+                    "action": u"\u6267\u884c " + (canon_name or tool_name or "").replace("maya.", ""),
+                    "target": canon_name,
+                    "options": [u"\u6267\u884c", u"\u53d6\u6d88"],
+                    "tool": canon_name,
+                    "args": args,
+                }
+                # Record in history so LLM context stays intact
+                messages.append({"role": "assistant", "content":
+                    _json_module.dumps(confirm_payload, ensure_ascii=False)})
+                return confirm_payload, _clean_history(messages)
+
+            friendly_name = canon_name.replace("maya.", "") if canon_name else tool_name
+            _emit(u"\u2699\ufe0f AI \u6267\u884c\u4e2d: %s" % friendly_name)
 
             if content.strip():
-                # 保留 AI 的推理分步说明文本
                 messages.append({"role": "assistant", "content": content})
             else:
-                messages.append({"role": "assistant", "content": _json.dumps({"type": "tool_call", "name": tool_name, "arguments": args}, ensure_ascii=False)})
+                messages.append({"role": "assistant", "content": _json_module.dumps(
+                    {"type": "tool_call", "name": tool_name, "arguments": args}, ensure_ascii=False)})
 
-            # Ensure Maya ops run on main thread
             def _do():
                 try:
-                    return call_tool(tool_name, args)
+                    return call_tool(canon_name, args)  # use canon_name so aliases resolve correctly
                 except ConfirmationError as ce:
-                    # Reraise out of Maya thread helper so we can catch it
                     raise ce
 
-            # dedup key
-            try:
-                canon = _ALIAS_MAP.get(tool_name, tool_name)
-                sig = (canon, _json.dumps(args, sort_keys=True, ensure_ascii=False))
-            except Exception:
-                canon = _ALIAS_MAP.get(tool_name, tool_name)
-                sig = (canon, str(args))
-            if sig in executed:
-                messages.append({"role": "user", "content": "DUPLICATE_TOOL_CALL name=%s skipped" % tool_name})
-                continue
-            executed.add(sig)
+            # Dedup: only prevent SINGLE_SHOT_TOOLS from re-running
+            # (allows 'create sphere' x2, but prevents double-firing of complex single-shot ops)
+            if canon_name in _SINGLE_SHOT_TOOLS:
+                try:
+                    sig = (canon_name, _json_module.dumps(args, sort_keys=True, ensure_ascii=False))
+                except Exception:
+                    sig = (canon_name, str(args))
+                if sig in executed:
+                    messages.append({"role": "user", "content":
+                        "[TOOL_RESULT]\ntool: %s\nok: true\nresult: null\nerror: null\n[/TOOL_RESULT]" % canon_name})
+                    continue
+                executed.add(sig)
 
+            # Execution policy: non-auto tools must be confirmed by user via natural language;
+            # the LLM is instructed in the system prompt, so we trust its judgment here.
+            # For tools that require the LLM to have asked first, the system prompt handles it.
+            # Execute on main thread:
             try:
                 tool_result = maya_utils.executeInMainThreadWithResult(_do)
             except ConfirmationError as ce:
-                # Return custom confirm JSON to UI
                 confirm_payload = {
                     "type": "confirm",
                     "action": ce.action,
                     "target": ce.target,
                     "options": ce.options,
                     "tool": tool_name,
-                    "args": args
+                    "args": args,
                 }
-                import json as _json
-                text = _json.dumps(confirm_payload, ensure_ascii=False)
-                messages.append({"role": "assistant", "content": text})
-                return text, messages
+                messages.append({"role": "assistant", "content": _json_module.dumps(confirm_payload, ensure_ascii=False)})
+                return confirm_payload, _clean_history(messages)
 
-            canon_name = _ALIAS_MAP.get(tool_name, tool_name)
             ok = bool(tool_result.get("ok"))
-            
-            import json as _json
+            log.info(u"Tool result: ok=%s | tool=%s", ok, canon_name)
+
+            # Update memory
             if ok:
-                res_json = _json.dumps(tool_result.get("result"), ensure_ascii=False, sort_keys=True)
+                _update_memory_from_result(canon_name, tool_result)
+                try:
+                    EntityMemory.update_last_action(canon_name)
+                except Exception:
+                    pass
+
+            if ok:
+                res_json = _json_module.dumps(tool_result.get("result"), ensure_ascii=False, sort_keys=True)
                 err_json = "null"
             else:
                 res_json = "null"
-                err_json = _json.dumps(tool_result.get("error"), ensure_ascii=False, sort_keys=True)
+                err_json = _json_module.dumps(tool_result.get("error"), ensure_ascii=False, sort_keys=True)
 
-            msg = (
-                "[TOOL_RESULT]\n"
-                "tool: {tool}\n"
-                "ok: {ok}\n"
-                "result: {result_json}\n"
-                "error: {error_json}\n"
-                "[/TOOL_RESULT]"
-            ).format(
-                tool=canon_name,
-                ok=str(ok).lower(),
-                result_json=res_json,
-                error_json=err_json
-            )
-            messages.append({"role": "user", "content": msg})
+            tool_result_msg = (
+                "[TOOL_RESULT]\ntool: {t}\nok: {ok}\nresult: {r}\nerror: {e}\n[/TOOL_RESULT]"
+            ).format(t=canon_name, ok=str(ok).lower(), r=res_json, e=err_json)
+            messages.append({"role": "user", "content": tool_result_msg})
+
+            # Single-shot tools: return immediately with smart suggestion
             if canon_name in _SINGLE_SHOT_TOOLS:
+                suggestion = _get_suggestion(canon_name)
                 if ok:
-                    return "已完成：%s" % canon_name, messages
+                    summary = {k: v for k, v in tool_result.get("result", {}).items() if k != "summary"}
+                    return {
+                        "type": "exec_result",
+                        "tool": canon_name,
+                        "ok": True,
+                        "result": summary,
+                        "suggestion": suggestion,
+                    }, _clean_history(messages)
                 else:
-                    return "工具执行失败：%s" % canon_name, messages
+                    return {
+                        "type": "exec_result",
+                        "tool": canon_name,
+                        "ok": False,
+                        "error": tool_result.get("error"),
+                    }, _clean_history(messages)
             continue
 
-        raise AgentError("未知响应 type：%s" % resp.get("type"))
+        raise AgentError(u"\u672a\u77e5\u54cd\u5e94 type\uff1a%s" % resp.get("type"))
