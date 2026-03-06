@@ -25,6 +25,7 @@ from .agent_runtime.intent_parser import parse_intent
 from .agent_runtime.scene_context import resolve_scene_context
 from .agent_runtime.capability_planner import plan_capabilities
 from .agent_runtime.capability_resolver import resolve_capabilities
+from .agent_runtime.smart_planner import build_planning_prompt, parse_plan_response, validate_smart_plan, summarize_plan_for_ui
 from .agent_runtime.semantic_objects import resolve_semantic_objects
 from .agent_runtime.task_graph import build_task_graph
 from .agent_runtime.plan_generator import generate_plan
@@ -168,7 +169,8 @@ _AGENT_TOOLS = {
     "modeling": {
         "maya.create_cube", "maya.create_sphere", "maya.create_cylinder",
         "maya.create_plane", "maya.rename_batch", "maya.group_and_center",
-        "maya.create_camera", "maya.camera_look_at", "maya.camera_frame_selection",
+        "maya.create_camera", "maya.camera_look_at", "maya.aim_at_target",
+        "maya.camera_frame_selection",
         "maya.create_three_point_lighting", "maya.create_turntable",
         "maya.ask_user_confirmation",
     },
@@ -389,47 +391,79 @@ def _base_prompt(role_desc, scene_ctx, mem_summary, tool_list=None):
         prompt += u"\n\n" + mem_summary
     return prompt
 
+_NARRATION_RULES = """
+## 回复规则
+
+当工具执行完毕后，你需要用自然语言总结结果。遵循以下原则：
+
+1. **绝不暴露**工具名、函数名、JSON、变量名
+   - ✗ "已调用 maya.create_bouncing_ball"
+   - ✓ "已经创建了一个弹跳小球"
+
+2. **说人话**：像一个有经验的 Maya 同事在跟你说话
+   - ✗ "执行报告：✅ 已create_bouncing_ball"  
+   - ✓ "小球已经放好了，弹跳3次，高度会逐渐衰减"
+
+3. **提炼关键参数**，不要罗列全部
+   - 只说用户关心的：尺寸、帧范围、数量等
+   - 忽略内部细节：subdiv、constraint名称等
+
+4. **给后续建议**（1-2个就够）
+   - 有动画 → 提醒播放预览
+   - 有摄像机 → 提醒切换视角
+   - 参数可调 → 提醒可以修改
+
+5. **长度控制**：3-5行，不要写小作文
+
+6. **如果执行失败**，用通俗语言解释原因和建议
+"""
+
 def _build_modeling_messages(user_text, scene_ctx, mem_summary, tool_list=None):
     role = (
         u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u5efa\u6a21\u4e13\u5bb6\u548c\u573a\u666f\u7ed3\u6784\u5e08\u3002"
         u"\u5c13\u957f\u5904\u7406\uff1a\u521b\u5efa\u51e0\u4f55\u4f53\u3001\u573a\u666f\u7ef4\u62a4\u3001\u6279\u91cf\u547d\u540d\u3001\u65b0\u589e\u6750\u8d28\u3002"
         u"\u521b\u5efa\u5b8c\u6210\u540e\u52a1\u5fc5\u7ed9\u51fa\u4e00\u6761\u4e13\u4e1a\u5efa\u8bae\u3002"
+        + _NARRATION_RULES
     )
     return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
             {"role": "user", "content": user_text}]
 
 def _build_animation_messages(user_text, scene_ctx, mem_summary, tool_list=None):
     role = (
-        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u52a8\u753b TD\u3002"
-        u"\u5c13\u957f\u521b\u5efa\u5404\u7c7b\u52a8\u753b\uff1a\u5e73\u79fb\u3001\u65cb\u8f6c\u3001\u5f39\u8df3\u3001\u5faa\u73af\u3001\u53d8\u5f62\u5173\u952e\u5e27\u3002"
-        u"\u521b\u5efa\u52a8\u753b\u540e\u52a1\u5fc5\u544a\u77e5\u5173\u952e\u5e27\u8303\u56f4\u5e76\u5efa\u8bae\u662f\u5426\u9700\u8981\u66f2\u7ebf\u8c03\u6574\u3002"
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u52a8\u753b TD\u3002\n"
+        u"\u5c13\u957f\u521b\u5efa\u5404\u7c7b\u52a8\u753b\uff1a\u5e73\u79fb\u3001\u65cb\u8f6c\u3001\u5f39\u8df3\u3001\u5faa\u73af\u3001\u53d8\u5f62\u5173\u952e\u5e27\u3002\n"
+        u"\u521b\u5efa\u52a8\u753b\u540e\u52a1\u5fc5\u544a\u77e5\u5173\u952e\u5e27\u8303\u56f4\u5e76\u5efa\u8bae\u662f\u5426\u9700\u8981\u66f2\u7ebf\u8c03\u6574\u3002\n"
+        + _NARRATION_RULES
     )
     return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
             {"role": "user", "content": user_text}]
 
 def _build_lighting_messages(user_text, scene_ctx, mem_summary, tool_list=None):
     role = (
-        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u706f\u5149\u5e08\u548c\u6444\u50cf\u5e08\u3002"
-        u"\u5c13\u957f\u521b\u5efa\u4e09\u70b9\u706f\u5149\u3001\u8bbe\u7f6e\u4e3b\u6458\u50cf\u673a\u3001\u8f6c\u53f0\u5c55\u793a\u3002"
-        u"\u521b\u5efa\u540e\u52a1\u5fc5\u8bc4\u4ef7\u5149\u6e90\u5e76\u5efa\u8bae\u6e32\u67d3\u8bbe\u7f6e\u3002"
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u706f\u5149\u5e08\u548c\u6444\u50cf\u5e08\u3002\n"
+        u"\u5c13\u957f\u521b\u5efa\u4e09\u70b9\u706f\u5149\u3001\u8bbe\u7f6e\u4e3b\u6458\u50cf\u673a\u3001\u8f6c\u53f0\u5c55\u793a\u3002\n"
+        u"\u521b\u5efa\u540e\u52a1\u5fc5\u8bc4\u4ef7\u5149\u6e90\u5e76\u5efa\u8bae\u6e32\u67d3\u8bbe\u7f6e\u3002\n"
+        + _NARRATION_RULES
     )
     return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
             {"role": "user", "content": user_text}]
 
 def _build_scene_messages(user_text, scene_ctx, mem_summary, tool_list=None):
     role = (
-        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u573a\u666f\u5206\u6790\u5e08\u3002"
-        u"\u4f18\u5148\u8c03\u7528 maya.scan_scene_summary \u83b7\u53d6\u5b8c\u6574\u573a\u666f\u4fe1\u606f\uff0c\u518d\u7ec4\u7ec7\u81ea\u7136\u8bed\u8a00\u56de\u7b54\u3002"
-        u"\u4e0d\u8981\u5217\u51fa Maya \u5185\u7f6e\u76f8\u673a\uff08persp/top/front/side\uff09\u3002"
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u573a\u666f\u5206\u6790\u5e08\u3002\n"
+        u"\u4f18\u5148\u8c03\u7528 maya.scan_scene_summary \u83b7\u53d6\u5b8c\u6574\u573a\u666f\u4fe1\u606f\uff0c\u518d\u7ec4\u7ec7\u81ea\u7136\u8bed\u8a00\u56de\u7b54\u3002\n"
+        u"\u4e0d\u8981\u5217\u51fa Maya \u5185\u7f6e\u76f8\u673a\uff08persp/top/front/side\uff09\u3002\n"
+        + _NARRATION_RULES
     )
     return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
             {"role": "user", "content": user_text}]
 
 def _build_general_messages(user_text, scene_ctx, mem_summary, tool_list=None):
     role = (
-        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u8d44\u6df1\u6280\u672f\u603b\u76d1\uff08TD\uff09\u3002"
-        u"\u5904\u7406\u590d\u6742\u4efb\u52a1\u3001\u9ad8\u7ea7\u64cd\u4f5c\u3001Python \u811a\u672c\u3001\u8de8\u88c1\u9886\u57df\u95ee\u9898\u3002"
-        u"\u65e0\u5bf9\u5e94\u4e13\u7528\u5de5\u5177\u7684\u9700\u6c42\u5fc5\u987b\u7528 maya.execute_python_code\u3002"
+        u"\u4f60\u662f\u4e00\u4e2a Maya 2020 \u8d44\u6df1\u6280\u672f\u603b\u76d1\uff08TD\uff09\u3002\n"
+        u"\u5904\u7406\u590d\u6742\u4efb\u52a1\u3001\u9ad8\u7ea7\u64cd\u4f5c\u3001Python \u811a\u672c\u3001\u8de8\u88c1\u9886\u57df\u95ee\u9898\u3002\n"
+        u"\u65e0\u5bf9\u5e94\u4e13\u7528\u5de5\u5177\u7684\u9700\u6c42\u5fc5\u987b\u7528 maya.execute_python_code\u3002\n"
+        + _NARRATION_RULES
     )
     return [{"role": "system", "content": _base_prompt(role, scene_ctx, mem_summary, tool_list)},
             {"role": "user", "content": user_text}]
@@ -454,6 +488,84 @@ _CREATION_SUGGESTIONS = {
 
 def _get_suggestion(canon_name):
     return _CREATION_SUGGESTIONS.get(canon_name, "")
+
+
+def narrate_execution_result(user_text, result_summary):
+    """
+    将技术执行摘要（result_summary）转成自然语言，返回字符串。
+    若 narration LLM 调用失败，返回原始 result_summary（安全 fallback）。
+    可被 dock.py 直接 import 使用。
+    """
+    try:
+        cfg = cfgmod.load_config()
+        gateway_url = (cfg.get("gateway_url") or "").rstrip("/")
+        if not gateway_url:
+            return result_summary
+        provider = (cfg.get("provider") or "deepseek").strip().lower()
+        api_key  = cfg.get("gemini_api_key") if provider == "gemini" else cfg.get("deepseek_api_key")
+        model    = _model_for_provider(cfg)
+        narration_messages = _build_narration_messages(user_text, result_summary)
+        payload = {
+            "provider":          provider,
+            "api_key":           api_key,
+            "model":             model,
+            "messages":          narration_messages,
+            "temperature":       float(cfg.get("temperature", 0.2)),
+            "max_output_tokens": 1024,
+        }
+        resp = post_json(gateway_url + "/chat", payload, timeout_s=30)
+        if resp:
+            return (
+                resp.get("content")
+                or resp.get("message", {}).get("content", result_summary)
+                or result_summary
+            )
+    except Exception as e:
+        log.warning(u"narrate_execution_result failed: %s — returning raw summary", e)
+    return result_summary
+
+
+def _build_plan_confirm_payload(user_text, plan):
+    """将 raw smart plan 转成 plan_confirm reply 结构，供前端渲染计划卡使用。"""
+    import uuid as _uuid
+    ui_plan = summarize_plan_for_ui(plan, user_text)
+    ui_plan["plan_id"] = str(_uuid.uuid4())   # 唯一 ID，用于追踪计划与执行的对应关系
+    ui_plan["raw_plan"] = plan                 # 保留完整 raw plan，执行时直接用
+    ui_plan["original_user_text"] = user_text
+    return {
+        "type": "plan_confirm",
+        "content": u"我已生成执行计划，请确认是否执行。",
+        "plan": ui_plan,
+    }
+
+
+
+def _build_narration_messages(user_text, result_summary, history_messages=None):
+    """
+    Constructs a request to the LLM to narrate the successfully completed tool execution results.
+    """
+    messages = history_messages[:] if history_messages else []
+    
+    role = (
+        u"\u4f60\u662f\u4e00\u4e2a\u7ecf\u9a8c\u4e30\u5bcc\u7684 Maya \u540c\u4e8b\u3002"
+        u"\u4f60\u521a\u521a\u5e2e\u52a9\u7528\u6237\u5b8c\u6210\u4e86\u4ee5\u4e0b\u64cd\u4f5c\u3002\u8bf7\u6839\u636e\u6267\u884c\u7ed3\u679c\u8fdb\u884c\u81ea\u7136\u8bed\u8a00\u603b\u7ed3\u3002\n"
+        + _NARRATION_RULES
+    )
+    
+    # Prepend or adapt the system prompt
+    if messages and messages[0].get("role") == "system":
+        messages[0] = {"role": "system", "content": role}
+    else:
+        messages.insert(0, {"role": "system", "content": role})
+        
+    prompt = (
+        u"\u3010\u7528\u6237\u539f\u59cb\u8bf7\u6c42\u3011\n%s\n\n"
+        u"\u3010\u6267\u884c\u7ed3\u679c\u3011\n%s\n\n"
+        u"\u8bf7\u6839\u636e\u4ee5\u4e0a\u6267\u884c\u7ed3\u679c\uff0c\u7528\u81ea\u7136\u7684\u4e2d\u6587\u56de\u590d\u7528\u6237\u3002"
+    ) % (user_text, result_summary)
+    
+    messages.append({"role": "user", "content": prompt})
+    return messages
 
 
 # ─────────────────────────────────────────────
@@ -593,7 +705,95 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
     task_type = analyze_task(effective_text)
     log.info(u"Task type: %s | text: %.60s", task_type, effective_text)
     
-    if task_type != "SIMPLE_TOOL":
+    if task_type == "COMPLEX_TASK":
+        tools = _TOOLS_SCHEMA_CACHE
+
+        log.info(u"Complex task detected, using Smart Planner (LLM-based)...")
+        _emit(u"🧠 AI 正在深度分析任务...")
+
+        # ── 尝试生成并验证计划 ──
+        plan = None
+        try:
+            # 1. 构造规划 Prompt
+            planning_system, planning_user = build_planning_prompt(
+                effective_text,
+                scene_context=scene_ctx,
+            )
+            planning_messages = [
+                {"role": "system", "content": planning_system},
+                {"role": "user",   "content": planning_user},
+            ]
+
+            _emit(u"🧠 AI 正在进行空间推理与任务规划...")
+
+            planning_payload = {
+                "provider":          provider,
+                "api_key":           api_key,
+                "model":             model,
+                "messages":          planning_messages,
+                "temperature":       0.1,
+                "max_output_tokens": 4096,
+            }
+
+            plan_resp = post_json(gateway_url + "/chat", planning_payload, timeout_s=60)
+
+            if plan_resp:
+                plan_text = (
+                    plan_resp.get("content")
+                    or plan_resp.get("message", {}).get("content", "")
+                )
+            else:
+                plan_text = ""
+
+            log.info(u"Smart Planner raw response:\n%s", plan_text[:2000])
+
+            # 2. 解析计划
+            plan = parse_plan_response(plan_text)
+            if not plan:
+                log.warning(u"Smart plan parse failed — no valid JSON plan returned by LLM")
+
+        except Exception as e:
+            log.error(u"Smart Planner exception: %s", e)
+            traceback.print_exc()
+            plan = None
+
+        # 3. 验证计划（parse 成功才走验证）
+        if plan:
+            validation_errors = validate_smart_plan(plan, _TOOLS_SCHEMA_CACHE)
+            # 过滤掉信息性标记（如 __has_python_code__），只保留真正的错误
+            real_errors = [e for e in validation_errors if not e.startswith("__")]
+            if real_errors:
+                log.warning(u"Smart plan validation errors: %s", real_errors)
+                plan = None
+
+        # 4a. 规划成功 → 返回 plan_confirm，等待用户确认（不自动执行）
+        if plan:
+            reasoning = plan.get("reasoning", "")
+            if reasoning:
+                log.info(u"Smart Planner reasoning: %s", reasoning)
+
+            _emit(u"📋 计划已生成，等待确认...")
+            payload = _build_plan_confirm_payload(effective_text, plan)
+            messages = history_messages[:] if history_messages else []
+            messages.append({"role": "user",      "content": effective_text})
+            messages.append({"role": "assistant",  "content": payload["content"]})
+            return payload, _clean_history(messages)
+
+        # 4b. 规划失败 → 返回友好提示，严禁 fall-through 到标准 LLM 路径
+        else:
+            fail_msg = (
+                u"这个任务比较复杂，我暂时没能生成稳定的执行计划。"
+                u"建议你换一种更明确的描述，或者拆成更小的步骤来做。"
+            )
+            log.warning(u"COMPLEX_TASK planning failed — returning failure message, NOT falling through.")
+            _emit(u"⚠️ 规划失败")
+            messages = history_messages[:] if history_messages else []
+            messages.append({"role": "user",      "content": effective_text})
+            messages.append({"role": "assistant",  "content": fail_msg})
+            return {"type": "text", "content": fail_msg}, _clean_history(messages)
+        # ↑ COMPLEX_TASK 所有路径均已 return，不会 fall-through
+            
+    if task_type == "SIMPLE_TOOL":
         log.info(u"Evaluating Deterministic NL Pipeline...")
         try:
             # 1. Deterministic Intent Parse
@@ -643,10 +843,35 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
                     
                     # Execute Deterministic Plan
                     result_summary = execute_plan(plan, available_tools=_TOOLS_SCHEMA_CACHE, emit_status=_emit)
+                    
+                    _emit(u"📝 AI 生成自然语言回复...")
+                    narration_messages = _build_narration_messages(effective_text, result_summary)
+                    
+                    payload = {
+                        "provider": provider,
+                        "api_key": api_key,
+                        "model": model,
+                        "messages": narration_messages,
+                        "temperature": temperature,
+                        "max_output_tokens": 1024,
+                    }
+                    try:
+                        resp = post_json(gateway_url + "/chat", payload, timeout_s=30)
+                        if resp:
+                            final_text = (
+                                resp.get("content")
+                                or resp.get("message", {}).get("content", result_summary)
+                            )
+                        else:
+                            final_text = result_summary
+                    except Exception as e:
+                        log.error("Narration failed: %s", e)
+                        final_text = result_summary
+                        
                     messages = history_messages if history_messages else []
                     messages.append({"role": "user", "content": effective_text})
-                    messages.append({"role": "assistant", "content": result_summary})
-                    return {"type": "text", "content": result_summary}, _clean_history(messages)
+                    messages.append({"role": "assistant", "content": final_text})
+                    return {"type": "text", "content": final_text}, _clean_history(messages)
 
             # If deterministic pipeline had no resolved tools or no actions,
             # fall through cleanly to the standard LLM tool-calling path below.
@@ -842,20 +1067,39 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
                 suggestion = _get_suggestion(canon_name)
                 if ok:
                     summary = {k: v for k, v in tool_result.get("result", {}).items() if k != "summary"}
-                    return {
-                        "type": "exec_result",
-                        "tool": canon_name,
-                        "ok": True,
-                        "result": summary,
-                        "suggestion": suggestion,
-                    }, _clean_history(messages)
+                    raw_res = "<SINGLE_SHOT_SUCCESS> Result: %s. Suggestion: %s" % (summary, suggestion)
                 else:
-                    return {
-                        "type": "exec_result",
-                        "tool": canon_name,
-                        "ok": False,
-                        "error": tool_result.get("error"),
-                    }, _clean_history(messages)
+                    raw_res = "<SINGLE_SHOT_FAILED> Error: %s" % tool_result.get("error")
+                
+                _emit(u"📝 AI 生成自然语言回复...")
+                narration_messages = _build_narration_messages(effective_text, raw_res)
+                
+                payload = {
+                    "provider": provider,
+                    "api_key": api_key,
+                    "model": model,
+                    "messages": narration_messages,
+                    "temperature": temperature,
+                    "max_output_tokens": 1024,
+                }
+                
+                try:
+                    resp = post_json(gateway_url + "/chat", payload, timeout_s=30)
+                    if resp:
+                        final_text = (
+                            resp.get("content")
+                            or resp.get("message", {}).get("content", raw_res)
+                        )
+                    else:
+                        final_text = raw_res
+                except Exception as e:
+                    log.error("Narration failed: %s", e)
+                    final_text = raw_res
+                
+                return {
+                    "type": "text",
+                    "content": final_text,
+                }, _clean_history(messages)
             continue
 
         raise AgentError(u"\u672a\u77e5\u54cd\u5e94 type\uff1a%s" % resp.get("type"))

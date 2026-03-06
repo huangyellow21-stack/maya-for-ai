@@ -29,7 +29,7 @@ def plan_capabilities(intent):
         capabilities.append("DUPLICATE_OBJECTS")
 
     # 2. Relation (Spatial)
-    if "around" in rels:
+    if "around" in rels and "rotate" not in acts:
         capabilities.append("SCATTER_AROUND")
     if "on_top_of" in rels:
         capabilities.append("PLACE_ON_TOP")

@@ -3,30 +3,36 @@
 # Map core capabilities to arrays of tools (primary, fallback)
 CAPABILITY_TOOL_MAP = {
     "CREATE_OBJECT": {
-        "sphere": ["maya.create_sphere"],
-        "cube": ["maya.create_cube"],
-        "cylinder": ["maya.create_cylinder"],
-        "plane": ["maya.create_plane"],
-        "camera": ["maya.create_camera"],
-        "light": ["maya.create_three_point_lighting"]
+        "sphere":     ["maya.create_sphere"],
+        "cube":       ["maya.create_cube"],
+        "cylinder":   ["maya.create_cylinder"],
+        "plane":      ["maya.create_plane"],
+        "camera":     ["maya.create_camera"],
+        "light":      ["maya.create_three_point_lighting"],
+        # FX / 特效资产 — 优先导入预制模板，禁止降级为普通几何
+        "explosion":  ["maya.import_bomb_asset"],
+        "bomb":       ["maya.import_bomb_asset"],
+        "fx":         ["maya.import_bomb_asset"],
     },
-    "DUPLICATE_OBJECTS": ["maya.execute_python_code", "maya.duplicate_objects"],
-    "SCATTER_AROUND": ["maya.execute_python_code"],
-    "PLACE_ON_TOP": ["maya.execute_python_code"],
-    "PLACE_NEXT_TO": ["maya.execute_python_code"],
-    "LINE_UP": ["maya.execute_python_code"],
-    "PLACE_INSIDE": ["maya.execute_python_code"],
-    "RANDOM_SCATTER": ["maya.randomize_transforms", "maya.execute_python_code"],
-    "ROTATE_ANIMATION": ["maya.create_loop_rotate", "maya.execute_python_code"],
-    "ORBIT_ANIMATION": ["maya.execute_python_code"], # complex orbit needs custom code
-    "BOUNCE_ANIMATION": ["maya.create_bouncing_ball", "maya.execute_python_code"],
-    "CAMERA_LOOK": ["maya.camera_look_at", "maya.execute_python_code"],
-    "CONSTRAINT_BIND": ["maya.execute_python_code"],
-    "OBJECT_FRACTURE": ["maya.execute_python_code"], # Intentionally missing plugins
-    "SCENE_CLEANUP": ["maya.delete_selected", "maya.cleanup_scene"],
-    "ROLL_ANIMATION": ["maya.create_loop_rotate", "maya.execute_python_code"],
-    "SURFACE_ATTACH": ["maya.execute_python_code"],
-    "FOLLOW_CAMERA": ["maya.camera_look_at", "maya.execute_python_code"]
+    "DUPLICATE_OBJECTS":  ["maya.execute_python_code", "maya.duplicate_objects"],
+    "SCATTER_AROUND":     ["maya.execute_python_code"],
+    "PLACE_ON_TOP":       ["maya.execute_python_code"],
+    "PLACE_NEXT_TO":      ["maya.execute_python_code"],
+    "LINE_UP":            ["maya.execute_python_code"],
+    "PLACE_INSIDE":       ["maya.execute_python_code"],
+    "ROTATE_ANIMATION":   ["maya.create_loop_rotate", "maya.execute_python_code"],
+    "ORBIT_ANIMATION":    ["maya.create_turntable", "maya.execute_python_code"],
+    "BOUNCE_ANIMATION":   ["maya.create_bouncing_ball", "maya.execute_python_code"],
+    "CONSTRAINT_BIND":    ["maya.execute_python_code"],
+    "OBJECT_FRACTURE":    ["maya.execute_python_code"],  # Intentionally missing plugins
+    "SCENE_CLEANUP":      ["maya.delete_selected", "maya.cleanup_scene"],
+    "ROLL_ANIMATION":     ["maya.create_loop_rotate", "maya.execute_python_code"],
+    "SURFACE_ATTACH":     ["maya.execute_python_code"],
+    "FOLLOW_CAMERA":      ["maya.camera_look_at", "maya.execute_python_code"],
+    # FX 特效 — 始终优先模板，绝不降级为普通球体或 execute_python_code
+    "FX_EXPLOSION":       ["maya.import_bomb_asset"],
+    "FX_LIGHTING":        ["maya.create_three_point_lighting", "maya.execute_python_code"],
+    "PRODUCT_TURNTABLE":  ["maya.create_turntable", "maya.execute_python_code"],
 }
 
 def resolve_capabilities(capabilities, targets, available_tools_schema):
@@ -40,11 +46,16 @@ def resolve_capabilities(capabilities, targets, available_tools_schema):
 
     # Gather ALL creation targets (support multi-type creation like "plane + spheres")
     creation_targets = []
-    for tg in ["plane", "sphere", "cube", "cylinder", "camera", "light"]:
+    _FX_TARGETS = {"explosion", "bomb", "fx"}
+    for tg in ["plane", "sphere", "cube", "cylinder", "camera", "light",
+               "explosion", "bomb", "fx"]:
         if tg in targets:
             creation_targets.append(tg)
     if not creation_targets:
-        creation_targets = ["sphere"]  # default
+        # 对 FX / 爆炸类请求：不 fallback 到 sphere，交给上层 planner 处理
+        has_fx_intent = bool(_FX_TARGETS & set(str(t).lower() for t in targets))
+        if not has_fx_intent:
+            creation_targets = ["sphere"]  # generic create-object default only
 
     for cap in capabilities:
         tools_for_cap = []

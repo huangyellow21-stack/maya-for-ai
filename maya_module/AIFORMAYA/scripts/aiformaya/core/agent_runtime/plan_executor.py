@@ -36,22 +36,26 @@ def cancel_execution():
 
 # Friendly names for UX
 _FRIENDLY_NAMES = {
-    "maya.create_cube": u"\u521b\u5efa\u65b9\u5757",
-    "maya.create_sphere": u"\u521b\u5efa\u7403\u4f53",
-    "maya.create_cylinder": u"\u521b\u5efa\u5706\u67f1",
-    "maya.create_plane": u"\u521b\u5efa\u5e73\u9762",
-    "maya.create_camera": u"\u521b\u5efa\u6444\u50cf\u673a",
-    "maya.create_three_point_lighting": u"\u521b\u5efa\u4e09\u70b9\u5e03\u5149",
-    "maya.create_turntable": u"\u521b\u5efa\u81ea\u52a8\u8f6c\u53f0",
-    "maya.randomize_transforms": u"\u968f\u673a\u6446\u653e\u4f4d\u7f6e",
-    "maya.camera_look_at": u"\u6444\u50cf\u673a\u770b\u5411\u76ee\u6807",
-    "maya.camera_frame_selection": u"\u6444\u50cf\u673a\u6846\u9009(F)",
-    "maya.group_and_center": u"\u6253\u7ec4\u5e76\u5c45\u4e2d\u8f74\u5fc3",
-    "maya.execute_python_code": u"\u6279\u91cf\u521b\u5efa / \u6267\u884c\u4ee3\u7801",
-    "maya.rename_batch": u"\u6279\u91cf\u91cd\u547d\u540d",
-    "maya.assign_color_materials": u"\u5206\u914d\u968f\u673a\u5f69\u8272\u6750\u8d28",
-    "maya.create_loop_rotate": u"\u521b\u5efa\u5faa\u73af\u65cb\u8f6c\u52a8\u753b",
-    "maya.create_bounce_animation": u"\u521b\u5efa\u5f39\u8df3\u52a8\u753b",
+    "maya.create_cube":                   u"创建方块",
+    "maya.create_sphere":                 u"创建球体",
+    "maya.create_cylinder":               u"创建圆柱",
+    "maya.create_plane":                  u"创建平面",
+    "maya.create_camera":                 u"创建摄像机",
+    "maya.create_three_point_lighting":   u"创建三点布光",
+    "maya.create_turntable":              u"创建自动转台",
+    "maya.randomize_transforms":          u"随机摆放位置",
+    "maya.camera_look_at":                u"摄像机看向目标",
+    "maya.camera_frame_selection":        u"摄像机框选(F)",
+    "maya.group_and_center":              u"打组并居中轴心",
+    "maya.execute_python_code":           u"批量创建 / 执行代码",
+    "maya.rename_batch":                  u"批量重命名",
+    "maya.assign_color_materials":        u"分配随机彩色材质",
+    "maya.create_loop_rotate":            u"创建循环旋转动画",
+    "maya.create_bounce_animation":       u"创建弹跳动画",
+    "maya.create_bouncing_ball":          u"创建弹跳球",
+    "maya.create_and_animate_translate_x": u"创建X轴平移动画",
+    # FX 特效 — 一定要有可读 UI 名，不能显示原始 tool 名
+    "maya.import_bomb_asset":             u"导入爆炸特效模板",
 }
 
 log = logging.getLogger("aiformaya")
@@ -80,6 +84,14 @@ def _call_tool_on_main_thread(tool_name, tool_args):
         return _do()
 
 
+def _resolve_alias(tool_name):
+    """Resolve tool aliases to canonical names. Lazy import to avoid circular deps."""
+    try:
+        from ..agent import _ALIAS_MAP
+        return _ALIAS_MAP.get(tool_name, tool_name)
+    except ImportError:
+        return tool_name
+
 def execute_plan(plan, available_tools, emit_status=None):
     """
     Executes a generated JSON plan sequentially in Maya.
@@ -88,17 +100,36 @@ def execute_plan(plan, available_tools, emit_status=None):
     available_tools: list of tool dicts from _TOOLS_SCHEMA_CACHE
     emit_status: callback(str) for real-time UI logging
 
-    Returns: string summary.
+    Returns: dict with keys:
+        text_summary   — human-readable string (backward compat)
+        step_results   — list of {tool, args, ok, result, error, purpose}
+        created_nodes  — list of node names created during execution
+        planned_tools  — tools listed in the plan
+        actual_tools   — tools actually executed (success only)
+        extra_tools    — executed but not in plan (should be empty)
+        missing_tools  — in plan but not executed
     """
     steps = plan.get("steps", [])[:8]
     if not steps:
         if emit_status:
             emit_status(u"\u26a0\ufe0f \u4efb\u52a1\u89c4\u5212\u672a\u751f\u6210\u6709\u6548\u6b65\u9aa4")
-        return u"\u672a\u751f\u6210\u6267\u884c\u6b65\u9aa4\u3002"
+        return {
+            "text_summary": u"\u672a\u751f\u6210\u6267\u884c\u6b65\u9aa4\u3002",
+            "step_results": [],
+            "created_nodes": [],
+            "planned_tools": [],
+            "actual_tools": [],
+            "extra_tools": [],
+            "missing_tools": [],
+        }
 
     allowed = {t["name"] for t in available_tools}
     results_summary = []
     entity_vars = {}
+    step_results = []
+    created_nodes = []
+    actual_tools_executed = []
+    planned_tools = [_resolve_alias(s.get("tool", "")) for s in steps]
 
     global EXECUTION_CANCELLED
     EXECUTION_CANCELLED = False
@@ -111,6 +142,7 @@ def execute_plan(plan, available_tools, emit_status=None):
             break
 
         tool = step.get("tool")
+        tool = _resolve_alias(tool)
         raw_args = step.get("args") or {}
 
         # --- Variable Substitution ---
@@ -141,8 +173,12 @@ def execute_plan(plan, available_tools, emit_status=None):
 
         raw_name = tool.replace("maya.", "") if tool else "Unknown"
         friendly_name = _FRIENDLY_NAMES.get(tool, raw_name)
+        purpose = step.get("purpose", friendly_name)
 
         log.info(u"Executor step %d/%d: %s, args=%s", i + 1, len(steps), tool, args)
+
+        if emit_status:
+            emit_status(u"\u2699\ufe0f AI \u6267\u884c\u6b65\u9aa4 %d/%d: %s" % (i + 1, len(steps), purpose))
 
         # --- Security: tool whitelist ---
         if tool not in allowed:
@@ -151,6 +187,7 @@ def execute_plan(plan, available_tools, emit_status=None):
             if emit_status:
                 emit_status(u"\u274c " + msg)
             results_summary.append(u"- [%d] %s: \u274c \u9519\u8bef (%s)" % (i + 1, friendly_name, msg))
+            step_results.append({"tool": tool, "args": args, "ok": False, "error": msg, "purpose": purpose})
             break
 
         # --- Security: execute_python_code content checks ---
@@ -171,6 +208,7 @@ def execute_plan(plan, available_tools, emit_status=None):
                 if emit_status:
                     emit_status(u"\u274c " + msg)
                 results_summary.append(u"\u274c \u9519\u8bef: %s" % msg)
+                step_results.append({"tool": tool, "args": args, "ok": False, "error": msg, "purpose": purpose})
                 break
 
             # Block dangerous modules
@@ -181,6 +219,7 @@ def execute_plan(plan, available_tools, emit_status=None):
                 if emit_status:
                     emit_status(u"\u274c " + msg)
                 results_summary.append(u"\u274c \u9519\u8bef: %s" % msg)
+                step_results.append({"tool": tool, "args": args, "ok": False, "error": msg, "purpose": purpose})
                 break
 
             # Block infinite loops
@@ -190,6 +229,7 @@ def execute_plan(plan, available_tools, emit_status=None):
                 if emit_status:
                     emit_status(u"\u274c " + msg)
                 results_summary.append(u"\u274c \u9519\u8bef: %s" % msg)
+                step_results.append({"tool": tool, "args": args, "ok": False, "error": msg, "purpose": purpose})
                 break
 
             # Limit code length
@@ -199,10 +239,8 @@ def execute_plan(plan, available_tools, emit_status=None):
                 if emit_status:
                     emit_status(u"\u274c " + msg)
                 results_summary.append(u"\u274c \u9519\u8bef: %s" % msg)
+                step_results.append({"tool": tool, "args": args, "ok": False, "error": msg, "purpose": purpose})
                 break
-
-        if emit_status:
-            emit_status(u"\u2699\ufe0f AI \u6267\u884c\u6b65\u9aa4 %d/%d: %s" % (i + 1, len(steps), friendly_name))
 
         # --- Execute on main thread (SINGLE dispatch, no nesting) ---
         try:
@@ -213,6 +251,7 @@ def execute_plan(plan, available_tools, emit_status=None):
             if emit_status:
                 emit_status(u"\u274c " + msg)
             results_summary.append(u"- [%d] %s: \u274c \u5931\u8d25 (%s)" % (i + 1, friendly_name, e))
+            step_results.append({"tool": tool, "args": args, "ok": False, "error": str(e), "purpose": purpose})
             break
 
         ok = bool(tool_result.get("ok"))
@@ -227,11 +266,30 @@ def execute_plan(plan, available_tools, emit_status=None):
             if emit_status:
                 emit_status(u"\u274c " + msg)
             results_summary.append(u"\u274c %s: \u9519\u8bef (%s)" % (friendly_name, err_msg))
+            step_results.append({"tool": tool, "args": args, "ok": False, "error": err_msg, "purpose": purpose, "result": None})
             break
 
-        # Success
+        # Success — record step result
+        result_data = tool_result.get("result") or {}
+        step_results.append({"tool": tool, "args": args, "ok": True, "error": None, "purpose": purpose, "result": result_data})
+        actual_tools_executed.append(tool)
         results_summary.append(u"\u2705 \u5df2%s" % friendly_name)
         log.info(u"Step result OK: %s", tool_result)
+
+        # Collect created node names for diagnostics (dedup during collection)
+        if isinstance(result_data, dict):
+            for key in ("created", "name", "transform", "camera", "node", "selection"):
+                val = result_data.get(key)
+                if val:
+                    if isinstance(val, list):
+                        for v in val:
+                            s = str(v)
+                            if s not in created_nodes:
+                                created_nodes.append(s)
+                    else:
+                        s = str(val)
+                        if s not in created_nodes:
+                            created_nodes.append(s)
 
         # --- Value Saving (save_as) ---
         save_as_key = step.get("save_as")
@@ -246,8 +304,6 @@ def execute_plan(plan, available_tools, emit_status=None):
                 entity_vars[save_as_key] = sel
 
         # --- Memory Updates ---
-        # NOTE: No executeInMainThreadWithResult here!
-        # We get creation info from the tool_result dict directly.
         try:
             EntityMemory.update_last_action(tool)
             if "create" in tool and isinstance(tool_result, dict):
@@ -267,4 +323,29 @@ def execute_plan(plan, available_tools, emit_status=None):
     if emit_status:
         emit_status(u"\u2705 \u8ba1\u5212\u5df2\u6267\u884c\u5b8c\u6bd5")
 
-    return u"**\u6267\u884c\u62a5\u544a\uff1a**\n" + "\n".join(results_summary)
+    # ── Plan vs Actual comparison log ──
+    actual_set = set(actual_tools_executed)
+    planned_set = set(planned_tools)
+    extra_tools = sorted(actual_set - planned_set)
+    missing_tools = sorted(planned_set - actual_set)
+
+    log.info(u"[PLAN VS ACTUAL] planned=%s", planned_tools)
+    log.info(u"[PLAN VS ACTUAL] actual=%s", actual_tools_executed)
+    if extra_tools:
+        log.warning(u"[PLAN VS ACTUAL] EXTRA tools (not in plan): %s", extra_tools)
+    if missing_tools:
+        log.warning(u"[PLAN VS ACTUAL] MISSING tools (in plan but not run): %s", missing_tools)
+    log.info(u"[CREATED NODES] %s", created_nodes)
+
+    text_summary = u"**\u6267\u884c\u62a5\u544a\uff1a**\n" + "\n".join(results_summary)
+
+    return {
+        "text_summary": text_summary,
+        "step_results": step_results,
+        "created_nodes": list(set(created_nodes)),
+        "planned_tools": planned_tools,
+        "actual_tools": actual_tools_executed,
+        "extra_tools": extra_tools,
+        "missing_tools": missing_tools,
+    }
+

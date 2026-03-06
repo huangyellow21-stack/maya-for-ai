@@ -20,6 +20,16 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
     semantic_env = semantic.get("environment")
     semantic_camera = semantic.get("camera")
 
+    # --- Capability Merging Pre-processing ---
+    all_caps = [r["capability"] for r in resolved_tools]
+    
+    # If BOUNCE_ANIMATION exists, skip sphere creation
+    skip_create_sphere = "BOUNCE_ANIMATION" in all_caps
+    
+    # If ORBIT_ANIMATION exists and there's a camera target, skip camera creation
+    skip_create_camera = "ORBIT_ANIMATION" in all_caps and semantic_camera
+    # ----------------------------------------
+
     subject_object = None
     environment_object = None
     camera_object = None
@@ -51,6 +61,13 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
                     if tg in targets:
                         obj_type = tg
                         break
+                        
+            # --- Skip Merged Creations ---
+            if obj_type == "sphere" and skip_create_sphere:
+                continue
+            if obj_type == "camera" and skip_create_camera:
+                continue
+            # ---------------------------
         
             current_var = "%s_%d" % (obj_type, var_counter)
             step = {
@@ -119,7 +136,9 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
             # Execute caller
             import json
             safe_spatial_target = json.dumps(spatial_target if spatial_target else "")
-            caller_code = "\ntarget = %s\n" % safe_spatial_target
+            caller_code = "\ntarget = variables.get('%s', [%s])\n" % (spatial_target, safe_spatial_target)
+            caller_code += "if isinstance(target, list) and target: target = target[0]\n"
+            caller_code += "elif isinstance(target, list): target = ''\n"
             
             # The items to scatter are either the newly created variables, or active selection
             safe_subject_object = json.dumps(subject_object if subject_object else "")
@@ -141,11 +160,15 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
             plan["steps"].append(step)
 
         elif cap == "BOUNCE_ANIMATION":
+            bounce_var = "bounce_%d" % var_counter
             step = {
                 "tool": "maya.create_bouncing_ball",
-                "args": {"target": "{%s}" % (subject_object if subject_object else "selection")}
+                "args": {"name": bounce_var},
+                "save_as": bounce_var
             }
             plan["steps"].append(step)
+            subject_object = bounce_var
+            var_counter += 1
 
         elif cap == "ROTATE_ANIMATION":
             step = {
@@ -154,11 +177,44 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
             }
             plan["steps"].append(step)
 
-        elif cap == "ROLL_ANIMATION":
-            # For testing, roll = rotate
+        elif cap == "ORBIT_ANIMATION":
+            orbit_target = subject_object or target_var or ""
             step = {
-                "tool": "maya.create_loop_rotate",
-                "args": {"target": "{%s}" % (subject_object if subject_object else "selection")}
+                "tool": "maya.create_turntable",
+                "args": {
+                    "target": orbit_target if orbit_target and not orbit_target.startswith("{") else "{%s}" % (subject_object or "selection"),
+                    "frames": 120
+                },
+                "save_as": "turntable_cam_%d" % var_counter
+            }
+            plan["steps"].append(step)
+            camera_object = "turntable_cam_%d" % var_counter
+            var_counter += 1
+
+        elif cap == "ROLL_ANIMATION":
+            roll_target = subject_object or target_var or ""
+            roll_code = """import maya.cmds as cmds
+target = '{target}'
+if not cmds.objExists(target):
+    sel = cmds.ls(sl=True)
+    target = sel[0] if sel else None
+if target:
+    bb = cmds.xform(target, q=True, ws=True, bb=True)
+    radius = (bb[4] - bb[1]) / 2.0 if bb else 1.0
+    distance = 20.0
+    start_frame = 1
+    end_frame = 120
+    cmds.setKeyframe(target, attribute='tx', t=start_frame, v=cmds.getAttr(target+'.tx'))
+    cmds.setKeyframe(target, attribute='rz', t=start_frame, v=0)
+    import math
+    rot = -(distance / (2 * math.pi * radius)) * 360
+    end_tx = cmds.getAttr(target+'.tx') + distance
+    cmds.setKeyframe(target, attribute='tx', t=end_frame, v=end_tx)
+    cmds.setKeyframe(target, attribute='rz', t=end_frame, v=rot)
+""".format(target=roll_target)
+            step = {
+                "tool": "maya.execute_python_code",
+                "args": {"code": roll_code}
             }
             plan["steps"].append(step)
 
@@ -180,6 +236,10 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
             plan["steps"].append(step)
 
         elif cap == "CAMERA_LOOK" or cap == "FOLLOW_CAMERA":
+            # Skip if turntable already handles it
+            if "ORBIT_ANIMATION" in all_caps:
+                continue
+            
             step = {
                 "tool": "maya.camera_look_at",
                 "args": {

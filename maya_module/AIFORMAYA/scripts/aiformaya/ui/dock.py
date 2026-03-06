@@ -9,6 +9,10 @@ import subprocess
 import time
 import functools
 import json
+import logging
+
+log = logging.getLogger("aiformaya")
+
 
 import maya.cmds as cmds
 try:
@@ -1536,6 +1540,10 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
                 suggestion = reply.get("suggestion", "")
                 if suggestion:
                     self._add_chat_bubble("ai", suggestion)
+            elif rtype == "plan_confirm":
+                # 复杂任务规划卡：展示计划内容，等待用户点击“执行”
+                plan_data = reply.get("plan", {})
+                self._add_plan_card(plan_data)
             else:
                 self._add_chat_bubble("ai", str(reply))
         else:
@@ -1722,27 +1730,102 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
         self.chatList.scrollToBottom()
 
     def _execute_plan(self, plan_data, original_text):
-        """Switch to edit mode and execute the confirmed plan."""
+        """直接执行已确认的 raw_plan（不重新调用 AI，错误则报告而非 fallback）。"""
         self._set_edit_mode(True)
         self._executing_plan = True
 
         self._add_chat_bubble("ai", u"...")
         self._ai_placeholder_item = self.chatList.item(self.chatList.count() - 1)
         self.sendBtn.setEnabled(False)
+        self.sendBtn.setVisible(False)
+        self.stopBtn.setVisible(True)
         self.input.setEnabled(False)
 
-        import copy
-        history_copy = copy.deepcopy(self.history)
-        execute_plan_payload = {
-            "plan_id": plan_data.get("plan_id", ""),
-            "original_user_text": original_text,
-            "execute_confirmed": True,
-        }
-        t = threading.Thread(
-            target=functools.partial(self._chat_thread_func, original_text, history_copy, execute_plan_payload)
-        )
+        raw_plan = plan_data.get("raw_plan")
+        plan_id  = plan_data.get("plan_id", "(no id)")
+        goal     = plan_data.get("goal", original_text)
+
+        if not raw_plan:
+            # raw_plan 缺失 → 直接报错，禁止 fallback
+            import json as _json
+            log.error(u"[EXECUTE] plan_id=%s raw_plan missing — refusing to fallback to AI", plan_id)
+            err_msg = u"计划数据不完整（raw_plan 缺失），请重新生成计划后再执行。"
+            import copy
+            new_history = copy.deepcopy(self.history)
+            new_history.append({"role": "user",      "content": original_text})
+            new_history.append({"role": "assistant",  "content": err_msg})
+            self.signals.chat_finished.emit({"type": "text", "content": err_msg}, new_history)
+            return
+
+        # ── 执行前打印完整 plan 信息（排查用）──
+        import json as _json
+        log.info(u"[EXECUTE] plan_id=%s | goal=%s", plan_id, goal)
+        try:
+            log.info(u"[EXECUTE] raw_plan=\n%s", _json.dumps(raw_plan, ensure_ascii=False, indent=2))
+        except Exception:
+            log.info(u"[EXECUTE] raw_plan (dump failed): %s", str(raw_plan)[:2000])
+
+        def _run_plan():
+            try:
+                from ..core.agent_runtime.plan_executor import execute_plan as _exec_plan
+                from ..core.agent import _TOOLS_SCHEMA_CACHE
+                from ..core.agent import run_chat as _run_chat
+
+                def _cb(status):
+                    self.signals.status_update.emit(status)
+
+                exec_result = _exec_plan(
+                    raw_plan,
+                    available_tools=_TOOLS_SCHEMA_CACHE,
+                    emit_status=_cb,
+                )
+
+                # exec_result 现在是结构化 dict
+                if isinstance(exec_result, dict):
+                    text_summary = exec_result.get("text_summary", u"执行完成。")
+                    created_nodes = exec_result.get("created_nodes", [])
+                    extra_tools   = exec_result.get("extra_tools", [])
+                    missing_tools = exec_result.get("missing_tools", [])
+                else:
+                    # 向后兼容：旧版可能返回字符串
+                    text_summary  = str(exec_result)
+                    created_nodes = []
+                    extra_tools   = []
+                    missing_tools = []
+
+                # ── 执行-计划对比警告 ──
+                if extra_tools:
+                    log.warning(u"[EXECUTE] plan_id=%s EXTRA tools executed (not in plan): %s",
+                                plan_id, extra_tools)
+                if missing_tools:
+                    log.warning(u"[EXECUTE] plan_id=%s MISSING tools (planned but not run): %s",
+                                plan_id, missing_tools)
+                if created_nodes:
+                    log.info(u"[EXECUTE] plan_id=%s created_nodes=%s", plan_id, created_nodes)
+
+                # ── 自然语言转述 ──
+                _cb(u"📝 AI 生成回复...")
+                try:
+                    from ..core.agent import narrate_execution_result as _narrate
+                    natural_reply = _narrate(original_text, text_summary)
+                except Exception as narr_e:
+                    log.warning(u"[EXECUTE] narration failed: %s — showing raw summary", narr_e)
+                    natural_reply = text_summary
+
+                reply = {"type": "text", "content": natural_reply}
+                import copy
+                new_history = copy.deepcopy(self.history)
+                new_history.append({"role": "user",      "content": original_text})
+                new_history.append({"role": "assistant",  "content": natural_reply})
+                self.signals.chat_finished.emit(reply, new_history)
+
+            except Exception as e:
+                self.signals.chat_error.emit(str(e))
+
+        t = threading.Thread(target=_run_plan)
         t.daemon = True
         t.start()
+
 
     def on_chat_error(self, error):
         self.sendBtn.setEnabled(True)

@@ -654,6 +654,37 @@ def tool_euler_filter(args):
     return {"processed_objects": transforms, "time_range": {"start": start, "end": end}, "count": len(transforms)}
 
 
+def _apply_transform_args(node, args):
+    """
+    将 args 中的 translate/rotate/scale 应用到 node。
+    在每个 create_* 工具创建并命名后调用。
+    """
+    translate = args.get("translate")
+    rotate    = args.get("rotate")
+    scale     = args.get("scale")
+    try:
+        if isinstance(translate, (list, tuple)) and len(translate) == 3:
+            cmds.setAttr(
+                node + ".translate",
+                float(translate[0]), float(translate[1]), float(translate[2]),
+                type="double3"
+            )
+        if isinstance(rotate, (list, tuple)) and len(rotate) == 3:
+            cmds.setAttr(
+                node + ".rotate",
+                float(rotate[0]), float(rotate[1]), float(rotate[2]),
+                type="double3"
+            )
+        if isinstance(scale, (list, tuple)) and len(scale) == 3:
+            cmds.setAttr(
+                node + ".scale",
+                float(scale[0]), float(scale[1]), float(scale[2]),
+                type="double3"
+            )
+    except Exception as e:
+        raise ToolError("MAYA_COMMAND_FAILED", "应用变换失败：%s" % str(e))
+
+
 def tool_create_cube(args):
     size = float(args.get("size", 1.0))
     w = float(args.get("width", size))
@@ -681,8 +712,15 @@ def tool_create_cube(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        _apply_transform_args(actual, args)
         EntityMemory.update_last_created("cube", actual)
-        return {"transform": actual, "width": w, "height": h, "depth": d, "subdiv": {"x": sx, "y": sy, "z": sz}}
+        return {
+            "transform": actual,
+            "width": w, "height": h, "depth": d,
+            "subdiv": {"x": sx, "y": sy, "z": sz},
+            "translate": args.get("translate"),
+            "rotate":    args.get("rotate"),
+        }
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "polyCube 失败：%s" % str(e))
 
@@ -708,8 +746,15 @@ def tool_create_sphere(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        _apply_transform_args(actual, args)
         EntityMemory.update_last_created("sphere", actual)
-        return {"transform": actual, "radius": radius, "subdiv": {"axis": sx, "height": sy}}
+        return {
+            "transform": actual,
+            "radius": radius,
+            "subdiv": {"axis": sx, "height": sy},
+            "translate": args.get("translate"),
+            "rotate":    args.get("rotate"),
+        }
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "polySphere 失败：%s" % str(e))
 
@@ -737,12 +782,14 @@ def tool_create_cylinder(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        _apply_transform_args(actual, args)
         EntityMemory.update_last_created("cylinder", actual)
         return {
             "transform": actual,
-            "radius": radius,
-            "height": height,
+            "radius": radius, "height": height,
             "subdiv": {"axis": sa, "height": sh, "caps": sc},
+            "translate": args.get("translate"),
+            "rotate":    args.get("rotate"),
         }
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "polyCylinder 失败：%s" % str(e))
@@ -770,8 +817,15 @@ def tool_create_plane(args):
                         actual = cmds.rename(xform, cand)
                         break
                     i += 1
+        _apply_transform_args(actual, args)
         EntityMemory.update_last_created("plane", actual)
-        return {"transform": actual, "width": w, "height": h, "subdiv": {"x": sx, "y": sy}}
+        return {
+            "transform": actual,
+            "width": w, "height": h,
+            "subdiv": {"x": sx, "y": sy},
+            "translate": args.get("translate"),
+            "rotate":    args.get("rotate"),
+        }
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "polyPlane 失败：%s" % str(e))
 
@@ -780,6 +834,8 @@ def tool_create_camera(args):
     focal_length = args.get("focal_length", None)
     near_clip = args.get("near_clip", None)
     far_clip = args.get("far_clip", None)
+    translate = args.get("translate")   # [x, y, z] optional initial position
+    rotate    = args.get("rotate")      # [rx, ry, rz] optional initial rotation
     try:
         res = cmds.camera()
         xform = res[0] if isinstance(res, (list, tuple)) and res else res
@@ -807,8 +863,26 @@ def tool_create_camera(args):
                 cmds.setAttr(shape + ".nearClipPlane", float(near_clip))
             if far_clip is not None:
                 cmds.setAttr(shape + ".farClipPlane", float(far_clip))
+        # Apply initial position/rotation if provided
+        if translate and len(translate) == 3:
+            cmds.setAttr(actual + ".translate",
+                         float(translate[0]), float(translate[1]), float(translate[2]),
+                         type="double3")
+        if rotate and len(rotate) == 3:
+            cmds.setAttr(actual + ".rotate",
+                         float(rotate[0]), float(rotate[1]), float(rotate[2]),
+                         type="double3")
         EntityMemory.update_last_created("camera", actual)
-        return {"transform": actual, "shape": shape, "focal_length": focal_length, "near_clip": near_clip, "far_clip": far_clip}
+        return {
+            "camera":       actual,
+            "transform":    actual,
+            "shape":        shape,
+            "focal_length": focal_length,
+            "near_clip":    near_clip,
+            "far_clip":     far_clip,
+            "translate":    translate,
+            "rotate":       rotate,
+        }
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "camera 失败：%s" % str(e))
 
@@ -884,101 +958,97 @@ def _safe_unique_name(base):
 
 def tool_create_and_animate_translate_x(args):
     """
-    一次性完成：创建立方体 -> 在 start_time 打 translate 关键帧 ->
-              在 end_time 将 X 设为 end_x（或按 delta_x 相对移动）并打关键帧。
-    不依赖当前选择，直接对新建 transform 操作。
+    对已存在的 target 物体设置 translateX 关键帧动画。
+    不创建任何新几何体。若 target 不存在则报错。
+
+    支持两种参数约定：
+      新约定（规划器优先）：target, start_value, end_value, start_time, end_time
+      旧约定（向后兼容）：  target/name, end_x/delta_x, start_time, end_time
     """
-    size = float(args.get("size", 1.0))
-    w = float(args.get("width", size))
-    h = float(args.get("height", size))
-    d = float(args.get("depth", size))
-    name = args.get("name")
+    # ── 1. 解析 target ──
+    target = args.get("target") or args.get("name")
+    if not target or not isinstance(target, basestring) or not target.strip():
+        raise ToolError("ARG_VALIDATION_FAILED", "需要 target（物体名称）")
+    target = target.strip()
+    if not cmds.objExists(target):
+        raise ToolError("MAYA_INVALID_TARGET",
+                        "目标物体不存在：%s — 请先创建它，再添加动画" % target)
+
+    # ── 2. 解析时间 ──
     start_time = float(args.get("start_time", 1))
     end_time_arg = args.get("end_time")
     duration = args.get("duration")
     if end_time_arg is not None:
         end_time = float(end_time_arg)
     elif duration is not None:
-        end_time = float(start_time + float(duration))
+        end_time = start_time + float(duration)
     else:
-        end_time = float(start_time + 47.0)
-    has_end_x = "end_x" in args
-    has_delta_x = "delta_x" in args
-    if not has_end_x and not has_delta_x:
-        try:
-            dx = float(args.get("delta_x", 10.0))
-        except Exception:
-            dx = 10.0
-        args["delta_x"] = dx
-        has_delta_x = True
+        end_time = start_time + 47.0
     if end_time < start_time:
         raise ToolError("ARG_VALIDATION_FAILED", "end_time 必须 >= start_time")
 
+    # ── 3. 解析起止值 ──
+    # 新约定: start_value / end_value
+    # 旧约定: end_x / delta_x（相对当前 tx）
+    has_start_value = "start_value" in args
+    has_end_value   = "end_value"   in args
+    has_end_x       = "end_x"       in args
+    has_delta_x     = "delta_x"     in args
+
     try:
-        actual = None
-        if isinstance(name, basestring) and name.strip() and cmds.objExists(name.strip()):
-            # 目标已存在：复用该对象，而不是再创建一个（更“幂等”）
-            actual = name.strip()
-            # 调整几何尺寸：优先修改 polyCube 历史；若无历史则使用缩放近似
-            try:
-                shapes = cmds.listRelatives(actual, shapes=True) or []
-                hist = []
-                for s in shapes:
-                    hist += cmds.listHistory(s) or []
-                pc = None
-                for n in hist:
-                    if cmds.nodeType(n) == "polyCube":
-                        pc = n
-                        break
-                if pc:
-                    try:
-                        cmds.setAttr(pc + ".w", w)
-                        cmds.setAttr(pc + ".h", h)
-                        cmds.setAttr(pc + ".d", d)
-                    except Exception:
-                        pass
-                else:
-                    # 近似处理：对 transform 直接缩放
-                    cmds.setAttr(actual + ".sx", w)
-                    cmds.setAttr(actual + ".sy", h)
-                    cmds.setAttr(actual + ".sz", d)
-            except Exception:
-                pass
-        else:
-            # 正常创建新立方体
-            res = cmds.polyCube(w=w, h=h, d=d, sx=1, sy=1, sz=1)
-            xform = res[0] if isinstance(res, (list, tuple)) and res else res
-            actual = xform
-            if isinstance(name, basestring) and name.strip():
-                target = name.strip()
-                if not cmds.objExists(target):
-                    actual = cmds.rename(xform, target)
-                else:
-                    actual = cmds.rename(xform, _safe_unique_name(target))
-
-        # start key
-        cmds.currentTime(start_time, edit=True)
-        cmds.setKeyframe([actual + ".tx", actual + ".ty", actual + ".tz"])
-
-        # end key
-        cmds.currentTime(end_time, edit=True)
-        cur_tx = cmds.getAttr(actual + ".tx")
-        if has_end_x:
-            target_x = float(args.get("end_x"))
-        else:
-            target_x = float(cur_tx + float(args.get("delta_x")))
-        cmds.setAttr(actual + ".tx", target_x)
-        cmds.setKeyframe(actual + ".tx")
+        cur_tx = cmds.getAttr(target + ".tx")
     except Exception as e:
-        raise ToolError("MAYA_COMMAND_FAILED", "create and animate 失败：%s" % str(e))
+        raise ToolError("MAYA_COMMAND_FAILED", "无法读取 %s.tx: %s" % (target, e))
+
+    if has_start_value:
+        start_tx = float(args["start_value"])
+    else:
+        start_tx = cur_tx          # 以当前位置为起点
+
+    if has_end_value:
+        end_tx = float(args["end_value"])
+    elif has_end_x:
+        end_tx = float(args["end_x"])
+    elif has_delta_x:
+        end_tx = start_tx + float(args["delta_x"])
+    else:
+        end_tx = start_tx + 10.0  # 默认向右 10 单位
+
+    # ── 4. 设置关键帧（不改动任何几何） ──
+    try:
+        # 清理已有 tx 关键帧（防止覆盖混乱）
+        try:
+            cmds.cutKey(target, attribute="tx")
+        except Exception:
+            pass
+
+        cmds.currentTime(start_time, edit=True)
+        cmds.setAttr(target + ".tx", start_tx)
+        cmds.setKeyframe(target, attribute="tx", time=start_time, value=start_tx)
+
+        cmds.currentTime(end_time, edit=True)
+        cmds.setAttr(target + ".tx", end_tx)
+        cmds.setKeyframe(target, attribute="tx", time=end_time, value=end_tx)
+
+        # 线性 tangent → 匹匀平移速度不变（防止 ease-in/out 造成视觉不均匀）
+        cmds.keyTangent(target, attribute="tx",
+                        time=(start_time, start_time),
+                        inTangentType="linear", outTangentType="linear")
+        cmds.keyTangent(target, attribute="tx",
+                        time=(end_time, end_time),
+                        inTangentType="linear", outTangentType="linear")
+    except Exception as e:
+        raise ToolError("MAYA_COMMAND_FAILED", "设置 translateX 关键帧失败：%s" % str(e))
 
     return {
-        "transform": actual,
-        "size": {"w": w, "h": h, "d": d},
-        "start_time": start_time,
-        "end_time": end_time,
-        "end_x": target_x,
+        "target":      target,
+        "attribute":   "translateX",
+        "start_value": start_tx,
+        "end_value":   end_tx,
+        "start_time":  start_time,
+        "end_time":    end_time,
     }
+
 
 
 def tool_create_bouncing_ball(args):
@@ -1086,6 +1156,13 @@ def tool_create_loop_rotate(args):
         end_val = start_val + 360.0 * rotations
         cmds.setAttr("%s.%s" % (t, axis), end_val)
         cmds.setKeyframe(t, attribute=axis, time=end_time, value=end_val)
+        # 线性 tangent → 旋转匹配匹匀平移，视觉上不会有加速/减速是象
+        cmds.keyTangent(t, attribute=axis,
+                        time=(start_time, start_time),
+                        inTangentType="linear", outTangentType="linear")
+        cmds.keyTangent(t, attribute=axis,
+                        time=(end_time, end_time),
+                        inTangentType="linear", outTangentType="linear")
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "create loop rotate 失败：%s" % str(e))
     return {
@@ -1641,17 +1718,18 @@ def tool_create_turntable(args):
     except Exception as e:
         raise ToolError("MAYA_COMMAND_FAILED", "创建环绕摄像机失败：%s" % str(e))
         
+    # v2.2: update memory
+    try:
+        EntityMemory.update_last_created("camera", cam)
+    except Exception:
+        pass
+
     return {
         "summary": "根据对象尺寸智能设置了摄像机旋转半径 %s 和目标高度 %s" % (round(dist, 1), round(calc_height, 1)),
         "camera": cam,
         "center_locator": loc,
         "frames": frames
     }
-    # v2.2: update memory
-    try:
-        EntityMemory.update_last_created("camera", cam)
-    except Exception:
-        pass
 
 
 def tool_cleanup_scene(args):
@@ -2898,12 +2976,16 @@ TOOLS = [
     # ── v2.1 新增工具 ────────────────────────────────────────────────
     {
         "name": "maya.camera_look_at",
-        "description": "让指定摄像机朝向目标对象（先创建 aimConstraint，执行后立即删除约束，保持静帧朝向）。",
+        "description": (
+            "对摄像机创建 aimConstraint，使其持续朝向目标物体（跟随动画全程，not 静帧）。"
+            "若只需一次性对齐而不跟随，请使用 maya.aim_at_target 并传入 delete_constraint_after=true。"
+            "camera 和 target 都必须已在场景中存在。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "camera": {"type": "string", "description": "摄像机名称，例如 'camera1'"},
-                "target": {"type": "string", "description": "目标对象名称，例如 'pSphere1'"}
+                "camera": {"type": "string", "description": "摄像机 transform 名称，例如 'track_cam'"},
+                "target": {"type": "string", "description": "持续跟随的目标物体名称，例如 'rolling_ball'"}
             },
             "required": ["camera", "target"]
         },
@@ -2985,16 +3067,46 @@ TOOLS = [
 # ── v2.1 新工具实现 ────────────────────────────────────────────────────────
 
 def _tool_camera_look_at(args):
+    """
+    为摄像机创建持久 aimConstraint，使其全程跟随 target（不删除约束）。
+    若需一次性对齐，请改用 tool_aim_at_target(delete_constraint_after=True)。
+    """
     camera = args.get("camera", "")
     target = args.get("target", "")
     if not camera or not cmds.objExists(camera):
         raise ToolError("PARAM", u"摄像机不存在: %s" % camera)
     if not target or not cmds.objExists(target):
         raise ToolError("PARAM", u"目标对象不存在: %s" % target)
-    con = cmds.aimConstraint(target, camera, maintainOffset=False)
-    cmds.delete(con)
-    return {"camera": camera, "target": target,
-            "message": u"摄像机 %s 已朝向 %s" % (camera, target)}
+    # 清除已有 aimConstraint（用 listConnections 更可靠，因为 constraint 可能不是直接子节点）
+    existing = cmds.listConnections(camera, type="aimConstraint") or []
+    if existing:
+        existing = list(set(existing))  # 去重
+        try:
+            cmds.delete(existing)
+        except Exception:
+            pass
+    # 建立持续 aimConstraint
+    # Maya 摄像机默认沿本地 -Z 轴朝前 → aimVector=(0,0,-1)
+    # worldUpType="vector" + worldUpVector=(0,1,0) 防止镜头翻转
+    con = cmds.aimConstraint(
+        target, camera,
+        aimVector=(0, 0, -1),
+        upVector=(0, 1, 0),
+        worldUpType="vector",
+        worldUpVector=(0, 1, 0),
+        maintainOffset=False,
+        weight=1.0,
+    )
+    constraint_name = con[0] if isinstance(con, (list, tuple)) and con else con
+    return {
+        "camera":      camera,
+        "target":      target,
+        "constraint":  constraint_name,
+        "persistent":  True,
+        "aim_vector":  [0, 0, -1],
+        "up_vector":   [0, 1, 0],
+        "message":     u"摄像机 %s 已持续跟随 %s（aimConstraint: %s, aimVec=-Z）" % (camera, target, constraint_name),
+    }
 
 def _tool_camera_frame_selection(args):
     camera = args.get("camera") or ""
