@@ -320,6 +320,44 @@ def onMayaDroppedPythonFile(*_args):
         print(u"AI 小助手 安装完成！\n已复制到：\n%s\n并创建模块文件：\n%s\n\n【提示】虽然已动态加载，但为了最佳稳定性，建议重启 Maya。\n可在 Script Editor 中执行：\nimport aiformaya; aiformaya.show()"
               % ("\n".join([_norm(d) for d in installed_dirs]), "\n".join([_norm(m) for m in mod_paths])))
 
+        # 创建工具架按钮
+        try:
+            import maya.mel as mel
+            current_shelf = mel.eval('tabLayout -q -selectTab $gShelfTopLevel; ')
+            if current_shelf:
+                # 寻找我们刚刚安装的最新图标路径，取第一个有效的即可
+                icon_path = ""
+                for module_root_dst in installed_dirs:
+                    potential_icon = os.path.join(module_root_dst, "icon", u"应用左上角 Logo.png")
+                    if os.path.exists(potential_icon):
+                        icon_path = _norm(potential_icon)
+                        break
+                
+                if icon_path:
+                    # 检查是否已存在同名或同 command 的按钮，避免重复创建
+                    existing_buttons = cmds.shelfLayout(current_shelf, q=True, childArray=True) or []
+                    already_exists = False
+                    for btn in existing_buttons:
+                        if cmds.control(btn, exists=True) and cmds.objectTypeUI(btn) == "shelfButton":
+                            cmd = cmds.shelfButton(btn, q=True, command=True)
+                            if cmd and "import aiformaya; aiformaya.show()" in cmd:
+                                already_exists = True
+                                break
+                    
+                    if not already_exists:
+                        cmds.shelfButton(
+                            parent=current_shelf,
+                            label="AI Assistant",
+                            annotation=u"打开 AI 小助手",
+                            image=icon_path,
+                            image1=icon_path,
+                            command="import aiformaya; aiformaya.show()",
+                            sourceType="python"
+                        )
+                        print(u"已在当前工具架 [%s] 创建启动按钮。" % current_shelf)
+        except Exception as shelf_err:
+            print(u"创建工具架按钮跳过或失败：%s" % shelf_err)
+
 
         cmds.confirmDialog(
             title=u"成功",
