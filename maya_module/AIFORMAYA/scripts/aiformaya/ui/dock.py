@@ -317,7 +317,7 @@ class AiformayaWidget(QtWidgets.QWidget):
         self.logoLabel = QtWidgets.QLabel()
         self._set_label_icon(self.logoLabel, u"应用左上角 Logo.png", 24)
         topbar_layout.addWidget(self.logoLabel)
-        self.titleLabel = QtWidgets.QLabel("AIFORMAYA")
+        self.titleLabel = QtWidgets.QLabel(cfgmod.APP_DISPLAY_NAME)
         self.titleLabel.setObjectName("TitleLabel")
         topbar_layout.addWidget(self.titleLabel)
         topbar_layout.addStretch(1)
@@ -1462,7 +1462,8 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
             self._add_chat_bubble("ai", u"当前仅处理 Maya/动画相关问题。如需普通提问，请在前面加 !")
             return
 
-        self._add_chat_bubble("ai", "...")
+        init_html = self._build_thinking_html(u"AI 思考中...")
+        self._add_chat_bubble("ai", init_html)
         self._ai_placeholder_item = self.chatList.item(self.chatList.count() - 1)
 
         self.sendBtn.setEnabled(False)
@@ -1478,6 +1479,13 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
         t = threading.Thread(target=functools.partial(self._chat_thread_func, text, history_copy))
         t.daemon = True
         t.start()
+
+    def _build_thinking_html(self, text=u"AI 思考中..."):
+        icon_path = self._find_icon_path(u"AI思考（思考过程）.png")
+        if icon_path:
+            safe_url = QtCore.QUrl.fromLocalFile(icon_path).toString()
+            return u"<img src='%s' width='16' height='16'> %s" % (safe_url, text)
+        return text
 
     def _on_status_update(self, status_text):
         """Update the placeholder AI bubble text with current processing status.
@@ -1498,8 +1506,17 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
                     txt = label.text()
                     # Update the label that contains our status dots / prev status
                     if any(kw in txt for kw in ["...", u"\u601d\u8003\u4e2d", u"\u6267\u884c\u4e2d", u"\u5468\u671f",
-                                                 u"\u2699", u"\u2705", u"\u274c", u"\ud83e\udde0"]):
-                        label.setText(status_text)
+                                                 u"\u2699", u"\u2705", u"\u274c", u"\ud83e\udde0", "<img"]):
+                        icon_path = self._find_icon_path(u"AI思考（思考过程）.png")
+                        safe_url = QtCore.QUrl.fromLocalFile(icon_path).toString() if icon_path else ""
+                        thinking_kws = [u"思考", u"分析", u"规划", u"生成计划", u"生成回复"]
+                        is_thinking = any(kw in status_text for kw in thinking_kws)
+                        
+                        if safe_url and is_thinking:
+                            display_text = u"<img src='%s' width='16' height='16'> %s" % (safe_url, status_text)
+                        else:
+                            display_text = status_text
+                        label.setText(display_text)
                         break
 
     def _chat_thread_func(self, text, history, execute_plan=None):
@@ -1734,7 +1751,8 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
         self._set_edit_mode(True)
         self._executing_plan = True
 
-        self._add_chat_bubble("ai", u"...")
+        init_html = self._build_thinking_html(u"AI 思考中...")
+        self._add_chat_bubble("ai", init_html)
         self._ai_placeholder_item = self.chatList.item(self.chatList.count() - 1)
         self.sendBtn.setEnabled(False)
         self.sendBtn.setVisible(False)
@@ -1909,7 +1927,7 @@ def show():
     if cmds.workspaceControl(CONTROL_NAME, q=True, exists=True):
         cmds.deleteUI(CONTROL_NAME)
 
-    cmds.workspaceControl(CONTROL_NAME, label="AIFORMAYA", floating=False, retain=False)
+    cmds.workspaceControl(CONTROL_NAME, label=cfgmod.APP_DISPLAY_NAME, floating=False, retain=False)
 
     # Get Qt pointer for workspaceControl
     import maya.OpenMayaUI as omui

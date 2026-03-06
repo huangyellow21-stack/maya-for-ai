@@ -317,13 +317,13 @@ def onMayaDroppedPythonFile(*_args):
                     sys.path.append(scripts_path)
                     print(u"已动态添加路径到 sys.path: %s" % scripts_path)
 
-        print(u"AIFORMAYA 安装完成！\n已复制到：\n%s\n并创建模块文件：\n%s\n\n【提示】虽然已动态加载，但为了最佳稳定性，建议重启 Maya。\n可在 Script Editor 中执行：\nimport aiformaya; aiformaya.show()"
+        print(u"AI 小助手 安装完成！\n已复制到：\n%s\n并创建模块文件：\n%s\n\n【提示】虽然已动态加载，但为了最佳稳定性，建议重启 Maya。\n可在 Script Editor 中执行：\nimport aiformaya; aiformaya.show()"
               % ("\n".join([_norm(d) for d in installed_dirs]), "\n".join([_norm(m) for m in mod_paths])))
 
 
         cmds.confirmDialog(
             title=u"成功",
-            message=u"AIFORMAYA 安装完成。",
+            message=u"AI 小助手 安装完成。",
             button=[u"确定"],
             defaultButton=u"确定",
         )
@@ -332,7 +332,7 @@ def onMayaDroppedPythonFile(*_args):
         traceback.print_exc()
         cmds.confirmDialog(
             title=u"失败",
-            message=u"AIFORMAYA 安装失败：%s" % e,
+            message=u"AI 小助手 安装失败：%s" % e,
             button=[u"确定"],
             defaultButton=u"确定",
         )

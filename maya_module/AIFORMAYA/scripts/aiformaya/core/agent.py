@@ -665,7 +665,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
             match = re.search(r'```python(.*?)```', ast_text, re.DOTALL)
             if match:
                 code_str = match.group(1).strip()
-                _emit(u"🧠 AI 触发代码直接执行...")
+                _emit(u"AI 触发代码直接执行...")
                 ad_hoc_plan = {
                     "steps": [
                         {
@@ -701,7 +701,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
     tools = _filter_tools_for_agent(agent_type)
 
     # v2.3 Agent Runtime: Branch for complex tasks
-    _emit(u"🧠 AI 分析请求...")
+    _emit(u"AI 分析请求...")
     task_type = analyze_task(effective_text)
     log.info(u"Task type: %s | text: %.60s", task_type, effective_text)
     
@@ -709,7 +709,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
         tools = _TOOLS_SCHEMA_CACHE
 
         log.info(u"Complex task detected, using Smart Planner (LLM-based)...")
-        _emit(u"🧠 AI 正在深度分析任务...")
+        _emit(u"AI 正在深度分析任务...")
 
         # ── 尝试生成并验证计划 ──
         plan = None
@@ -724,7 +724,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
                 {"role": "user",   "content": planning_user},
             ]
 
-            _emit(u"🧠 AI 正在进行空间推理与任务规划...")
+            _emit(u"AI 正在进行空间推理与任务规划...")
 
             planning_payload = {
                 "provider":          provider,
@@ -772,7 +772,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
             if reasoning:
                 log.info(u"Smart Planner reasoning: %s", reasoning)
 
-            _emit(u"📋 计划已生成，等待确认...")
+            _emit(u"计划已生成，等待确认...")
             payload = _build_plan_confirm_payload(effective_text, plan)
             messages = history_messages[:] if history_messages else []
             messages.append({"role": "user",      "content": effective_text})
@@ -801,7 +801,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
             
             # We assume intent is valid if it found actionable verbs
             if intent.get("actions"):
-                _emit(u"🧠 AI 分析意图并规划系统能力...")
+                _emit(u"AI 分析意图并规划系统能力...")
                 caps = plan_capabilities(intent)
                 
                 # Semantic Objects
@@ -829,7 +829,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
                     return {"type": "text", "content": msg}, _clean_history(messages)
                     
                 if resolved:
-                    _emit(u"🧠 AI (Stable Layer) 生成执行计划...")
+                    _emit(u"AI (Stable Layer) 生成执行计划...")
                     import json
                     
                     # 1. Cache Check for Deterministic Plan
@@ -844,7 +844,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
                     # Execute Deterministic Plan
                     result_summary = execute_plan(plan, available_tools=_TOOLS_SCHEMA_CACHE, emit_status=_emit)
                     
-                    _emit(u"📝 AI 生成自然语言回复...")
+                    _emit(u"AI 生成自然语言回复...")
                     narration_messages = _build_narration_messages(effective_text, result_summary)
                     
                     payload = {
@@ -921,16 +921,16 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
 
         # Status: thinking
         if _first_llm_call[0]:
-            _emit(u"\U0001f9e0 AI \u601d\u8003\u4e2d...")
+            _emit(u"AI 思考中...")
             _first_llm_call[0] = False
         else:
-            _emit(u"\U0001f9e0 AI \u7ee7\u7eed\u601d\u8003...")
+            _emit(u"AI 继续思考...")
 
         try:
             resp = post_json(gateway_url + "/chat", payload, timeout_s=60)
         except HttpError as e:
             error_msg = u"\u7f51\u5173\u8bf7\u6c42\u8d85\u65f6\u6216\u5931\u8d25\uff1a%s" % str(e)
-            _emit(u"\u274c " + error_msg)
+            _emit(error_msg)
             messages.append({"role": "assistant", "content": error_msg})
             return {"type": "text", "content": error_msg}, _clean_history(messages)
 
@@ -993,7 +993,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
                 return confirm_payload, _clean_history(messages)
 
             friendly_name = canon_name.replace("maya.", "") if canon_name else tool_name
-            _emit(u"\u2699\ufe0f AI \u6267\u884c\u4e2d: %s" % friendly_name)
+            _emit(u"AI 执行中: %s" % friendly_name)
 
             if content.strip():
                 messages.append({"role": "assistant", "content": content})
@@ -1071,7 +1071,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
                 else:
                     raw_res = "<SINGLE_SHOT_FAILED> Error: %s" % tool_result.get("error")
                 
-                _emit(u"📝 AI 生成自然语言回复...")
+                _emit(u"AI 生成自然语言回复...")
                 narration_messages = _build_narration_messages(effective_text, raw_res)
                 
                 payload = {

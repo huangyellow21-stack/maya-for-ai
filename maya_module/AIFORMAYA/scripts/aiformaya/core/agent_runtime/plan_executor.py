@@ -112,7 +112,7 @@ def execute_plan(plan, available_tools, emit_status=None):
     steps = plan.get("steps", [])[:8]
     if not steps:
         if emit_status:
-            emit_status(u"\u26a0\ufe0f \u4efb\u52a1\u89c4\u5212\u672a\u751f\u6210\u6709\u6548\u6b65\u9aa4")
+            emit_status(u"任务规划未生成有效步骤")
         return {
             "text_summary": u"\u672a\u751f\u6210\u6267\u884c\u6b65\u9aa4\u3002",
             "step_results": [],
@@ -137,7 +137,7 @@ def execute_plan(plan, available_tools, emit_status=None):
     for i, step in enumerate(steps):
         if EXECUTION_CANCELLED:
             if emit_status:
-                emit_status(u"\u26d4 \u4efb\u52a1\u5df2\u53d6\u6d88")
+                emit_status(u"任务已取消")
             results_summary.append(u"\u26d4 \u4efb\u52a1\u5df2\u88ab\u7528\u6237\u624b\u52a8\u53d6\u6d88")
             break
 
@@ -178,14 +178,14 @@ def execute_plan(plan, available_tools, emit_status=None):
         log.info(u"Executor step %d/%d: %s, args=%s", i + 1, len(steps), tool, args)
 
         if emit_status:
-            emit_status(u"\u2699\ufe0f AI \u6267\u884c\u6b65\u9aa4 %d/%d: %s" % (i + 1, len(steps), purpose))
+            emit_status(u"AI 执行步骤 %d/%d: %s" % (i + 1, len(steps), purpose))
 
         # --- Security: tool whitelist ---
         if tool not in allowed:
             msg = u"\u53d7\u9650\u6b65\u9aa4\uff0c\u5de5\u5177\u4e0d\u5728\u6388\u6743\u5217\u8868\u4e2d: %s" % tool
             log.error(msg)
             if emit_status:
-                emit_status(u"\u274c " + msg)
+                emit_status(msg)
             results_summary.append(u"- [%d] %s: \u274c \u9519\u8bef (%s)" % (i + 1, friendly_name, msg))
             step_results.append({"tool": tool, "args": args, "ok": False, "error": msg, "purpose": purpose})
             break
@@ -249,7 +249,7 @@ def execute_plan(plan, available_tools, emit_status=None):
             msg = u"\u6267\u884c\u6b65\u9aa4 %d (%s) \u65f6\u5d29\u6e83: %s" % (i + 1, tool, e)
             log.error(msg)
             if emit_status:
-                emit_status(u"\u274c " + msg)
+                emit_status(msg)
             results_summary.append(u"- [%d] %s: \u274c \u5931\u8d25 (%s)" % (i + 1, friendly_name, e))
             step_results.append({"tool": tool, "args": args, "ok": False, "error": str(e), "purpose": purpose})
             break
@@ -264,7 +264,7 @@ def execute_plan(plan, available_tools, emit_status=None):
             msg = u"\u6b65\u9aa4 %d \u5931\u8d25: %s" % (i + 1, err_msg)
             log.error(msg)
             if emit_status:
-                emit_status(u"\u274c " + msg)
+                emit_status(msg)
             results_summary.append(u"\u274c %s: \u9519\u8bef (%s)" % (friendly_name, err_msg))
             step_results.append({"tool": tool, "args": args, "ok": False, "error": err_msg, "purpose": purpose, "result": None})
             break

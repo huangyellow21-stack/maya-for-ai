@@ -4,6 +4,9 @@ from __future__ import absolute_import
 import json
 import os
 
+APP_DISPLAY_NAME = u"AI 小助手"
+APP_INTERNAL_NAME = "AIFORMAYA"
+
 
 def _user_config_dir():
     # Maya on Windows usually has MAYA_APP_DIR, otherwise fall back to Documents\maya
