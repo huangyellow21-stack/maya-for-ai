@@ -40,5 +40,10 @@ def analyze_task(user_text):
         create_kws = [u"创建", u"生成", u"做一个", u"来个", "create", "make", "add", "spawn"]
         if any(kw in user_text.lower() or kw in user_text for kw in create_kws):
             return "BATCH_TASK"
+            
+    # 4. Check actions that require Deterministic AI Pipeline (animations, constraints, relations)
+    action_kws = [u"滚", u"跳", u"转", u"围绕", u"绕", u"看", u"对准", u"约束", u"碎", u"散布", u"铺满"]
+    if any(kw in user_text for kw in action_kws):
+        return "COMPLEX_TASK"
                 
     return "SIMPLE_TOOL"

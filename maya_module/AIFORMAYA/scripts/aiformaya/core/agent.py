@@ -21,12 +21,18 @@ from .agent_runtime.task_planner import plan_task
 from .agent_runtime.plan_executor import execute_plan
 from .agent_runtime.plan_cache import get_cached_plan, save_plan
 from .agent_runtime.plan_validator import validate_plan
+from .agent_runtime.intent_parser import parse_intent
+from .agent_runtime.scene_context import resolve_scene_context
+from .agent_runtime.capability_planner import plan_capabilities
+from .agent_runtime.capability_resolver import resolve_capabilities
+from .agent_runtime.semantic_objects import resolve_semantic_objects
+from .agent_runtime.task_graph import build_task_graph
+from .agent_runtime.plan_generator import generate_plan
 from ..tools.maya_tools import TOOLS as _TOOLS_SCHEMA_CACHE_RAW, tools_schema
 from ..tools.maya_tools import ConfirmationError
 from ..tools.registry import call_tool
-
 try:
-    from .memory import EntityMemory, resolve_entities
+    from .memory import EntityMemory
 except ImportError:
     class EntityMemory(object):
         @classmethod
@@ -39,6 +45,10 @@ except ImportError:
         def update_last_camera(cls, n): pass
         @classmethod
         def update_recent_objects(cls, names): pass
+        @classmethod
+        def get_last_created(cls): return {}
+        @classmethod
+        def get_recent_objects(cls): return []
 
 # ─────────────────────────────────────────────
 # Debug logger
@@ -200,12 +210,12 @@ _TOOLS_SCHEMA_CACHE = tools_schema()
 _ROUTER_RULES = [
     ("scene",     [u"场景", u"有什么", u"分析", u"摘要", u"查询", u"选中了什么",
                    u"里面有", u"包含什么", u"摄像机列表"]),
+    ("animation", [u"动画", u"旋转", u"位移", u"关键帧", u"弹跳", u"循环",
+                   u"k帧", u"K帧", u"retime", "animate", "keyframe"]),
     ("modeling", [u"创建", u"建模", u"物体", u"几何", u"材质", u"球", u"方块",
                   u"立方", u"平面", u"柱", u"组", u"复制", u"冻结", u"轴心", u"删除", "delete",
                   u"生成", u"做一个", u"放一个", u"来个", u"摄像机", u"看向", u"框选",
                   "create", "make", "add", "spawn", "model", "duplicate", "freeze", "camera", "look_at", "frame"]),
-    ("animation", [u"动画", u"旋转", u"位移", u"关键帧", u"弹跳", u"循环",
-                   u"k帧", u"K帧", u"retime", "animate", "keyframe"]),
     ("lighting",  [u"灯光", u"布光", u"三点光", u"转台", u"渲染",
                    "light", "turntable"]),
     ("general",   [u"脚本", u"代码", u"工具", u"插件", "python", "script"]),
@@ -534,6 +544,38 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
     agent_type = router_agent(effective_text)
     log.info(u"Agent type: %s | text: %s", agent_type, effective_text[:60])
 
+    # ── Handle simple Execute confirmation ──
+    if effective_text.strip() in [u"执行", u"是的", u"好", u"确认", u"开始"]:
+        last_turn = history_messages[-1] if history_messages else {}
+        if last_turn.get("role") == "assistant":
+            ast_text = last_turn.get("content", "")
+            # Look for python code block
+            match = re.search(r'```python(.*?)```', ast_text, re.DOTALL)
+            if match:
+                code_str = match.group(1).strip()
+                _emit(u"🧠 AI 触发代码直接执行...")
+                ad_hoc_plan = {
+                    "steps": [
+                        {
+                            "tool": "maya.execute_python_code",
+                            "args": {"code": code_str}
+                        }
+                    ]
+                }
+                try:
+                    res_summary = execute_plan(ad_hoc_plan, available_tools=_TOOLS_SCHEMA_CACHE, emit_status=_emit)
+                    messages = history_messages if history_messages else []
+                    messages.append({"role": "user", "content": effective_text})
+                    messages.append({"role": "assistant", "content": res_summary})
+                    return {"type": "text", "content": res_summary}, _clean_history(messages)
+                except Exception as e:
+                    error_msg = u"执行失败：%s" % e
+                    _emit(u"❌ " + error_msg)
+                    messages = history_messages if history_messages else []
+                    messages.append({"role": "user", "content": effective_text})
+                    messages.append({"role": "assistant", "content": error_msg})
+                    return {"type": "text", "content": error_msg}, _clean_history(messages)
+
     # ── Scene context (lightweight, may fail silently) ──
     try:
         scene_ctx = maya_utils.executeInMainThreadWithResult(_get_scene_context_safe)
@@ -552,49 +594,71 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
     log.info(u"Task type: %s | text: %.60s", task_type, effective_text)
     
     if task_type != "SIMPLE_TOOL":
-        log.info(u"Delegating to Agent Runtime Planner")
-        
+        log.info(u"Evaluating Deterministic NL Pipeline...")
         try:
-            # 1. Cache Check
-            plan = get_cached_plan(effective_text)
+            # 1. Deterministic Intent Parse
+            intent = parse_intent(effective_text)
             
-            # 2. Planning
-            if not plan:
-                _emit(u"🧠 AI 规划任务...")
-                plan = plan_task(effective_text, _TOOLS_SCHEMA_CACHE, gateway_url, provider, api_key, model)
-                save_plan(effective_text, plan)
-            else:
-                _emit(u"🧠 AI 启用快捷规划...")
+            # We assume intent is valid if it found actionable verbs
+            if intent.get("actions"):
+                _emit(u"🧠 AI 分析意图并规划系统能力...")
+                caps = plan_capabilities(intent)
                 
-            log.info(u"Generated Plan: %s", json.dumps(plan, ensure_ascii=False))
-            
-            # 3. Validation
-            validate_plan(plan, _TOOLS_SCHEMA_CACHE)
-            
-            # 4. Execution
-            result_summary = execute_plan(plan, available_tools=_TOOLS_SCHEMA_CACHE, emit_status=_emit)
-            
-            messages = history_messages if history_messages else []
-            messages.append({"role": "user", "content": effective_text})
-            messages.append({"role": "assistant", "content": result_summary})
-            return {"type": "text", "content": result_summary}, _clean_history(messages)
+                # Semantic Objects
+                semantic = resolve_semantic_objects(intent)
+                
+                # Enforce execution ordering
+                graph = build_task_graph(caps)
+                
+                # Context (already handles its own main thread dispatch safely via _query_scene)
+                try:
+                    ctx = resolve_scene_context(intent.get("targets", []), effective_text)
+                except Exception:
+                    ctx = {"selection": [], "last_created": {}, "target_nodes": []}
+                
+                # Map tools
+                resolved, unsupported = resolve_capabilities(graph, intent.get("targets", []), _TOOLS_SCHEMA_CACHE)
+                
+                if unsupported:
+                    # Unsupported fast-fail loop
+                    msg = "\n".join(unsupported)
+                    _emit(u"❌ " + msg)
+                    messages = history_messages if history_messages else []
+                    messages.append({"role": "user", "content": effective_text})
+                    messages.append({"role": "assistant", "content": msg})
+                    return {"type": "text", "content": msg}, _clean_history(messages)
+                    
+                if resolved:
+                    _emit(u"🧠 AI (Stable Layer) 生成执行计划...")
+                    import json
+                    
+                    # 1. Cache Check for Deterministic Plan
+                    plan = get_cached_plan(effective_text, intent=intent)
+                    
+                    if not plan:
+                        plan = generate_plan(intent, resolved, ctx, semantic)
+                        save_plan(effective_text, plan, intent=intent)
+                        
+                    log.info(u"Deterministic Plan: %s", json.dumps(plan, ensure_ascii=False))
+                    
+                    # Execute Deterministic Plan
+                    result_summary = execute_plan(plan, available_tools=_TOOLS_SCHEMA_CACHE, emit_status=_emit)
+                    messages = history_messages if history_messages else []
+                    messages.append({"role": "user", "content": effective_text})
+                    messages.append({"role": "assistant", "content": result_summary})
+                    return {"type": "text", "content": result_summary}, _clean_history(messages)
+
+            # If deterministic pipeline had no resolved tools or no actions,
+            # fall through cleanly to the standard LLM tool-calling path below.
+            # Do NOT create a second LLM planning path here — it causes
+            # Deterministic → LLM → Executor cascading conflicts.
+            log.info(u"Deterministic pipeline had no resolved tools. Falling through to standard LLM path.")
         except Exception as e:
             log.error(u"Agent Runtime \u5f02\u5e38: %s", e)
-            # The user's diff snippet seems to indicate an insertion here, but it's malformed.
-            # Assuming the intent was to add a scene scan and emit *outside* the exception block,
-            # or that the provided diff was a fragment of a larger change.
-            # Based on the instruction "add emit before scan_scene_summary", and the original code
-            # having `_get_scene_context_safe`, I've placed the emit before that call.
-            # The provided diff snippet for this section is syntactically incorrect and
-            # seems to be a partial or corrupted instruction. I will ignore the malformed
-            # part of the diff and only apply the clear instruction about `_emit` and `_scan_scene_summary`
-            # by placing `_emit` before the existing scene context gathering.
-            error_msg = u"\u4efb\u52a1\u89c4\u5212\u6216\u6267\u884c\u5931\u8d25\uff1a%s" % str(e)
-            _emit(u"\u274c " + error_msg)
-            messages = history_messages if history_messages else []
-            messages.append({"role": "user", "content": effective_text})
-            messages.append({"role": "assistant", "content": error_msg})
-            return {"type": "text", "content": error_msg}, _clean_history(messages)
+            import traceback
+            traceback.print_exc()
+            # Fall through to standard LLM path instead of returning an error
+            log.info(u"Deterministic pipeline error, falling through to LLM path.")
 
     # ── Build messages (pass tool_list for capability prompt) ──
     builder = _AGENT_BUILDERS.get(agent_type, _build_general_messages)
@@ -613,6 +677,7 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
     turns = 0
     executed = set()
     _first_llm_call = [True]  # track first vs subsequent calls
+    consecutive_tool_calls = 0
 
     while True:
         turns += 1
@@ -639,13 +704,17 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
         try:
             resp = post_json(gateway_url + "/chat", payload, timeout_s=60)
         except HttpError as e:
-            raise AgentError(u"\u7f51\u5173\u8bf7\u6c42\u5931\u8d25\uff1a%s" % str(e))
+            error_msg = u"\u7f51\u5173\u8bf7\u6c42\u8d85\u65f6\u6216\u5931\u8d25\uff1a%s" % str(e)
+            _emit(u"\u274c " + error_msg)
+            messages.append({"role": "assistant", "content": error_msg})
+            return {"type": "text", "content": error_msg}, _clean_history(messages)
 
         if not resp or "type" not in resp:
             raise AgentError(u"\u7f51\u5173\u8fd4\u56de\u65e0\u6548\u54cd\u5e94\uff1a%s" % str(resp))
 
         # ── Text response ──
         if resp["type"] == "message":
+            consecutive_tool_calls = 0 # reset limit
             text = resp.get("content") or u"\u64cd\u4f5c\u5df2\u5b8c\u6210\u3002"
             text = re.sub(r"^(\u6267\u884c\u56de\u636e\uff1a|\u6267\u884c\u56de\u636e:|<final_execution_receipt>)", "", text.strip()).strip()
             if not text:
@@ -656,6 +725,9 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
 
         # ── Tool call ──
         if resp["type"] == "tool_call":
+            consecutive_tool_calls += 1
+            if consecutive_tool_calls >= 3:
+                raise AgentError(u"连续调用工具次数过多(>3次)，已强制终止以防死循环。")
             tool_name = resp.get("name")
             args = resp.get("arguments") or {}
             content = resp.get("content") or ""
@@ -726,9 +798,10 @@ def run_chat(user_text, history_messages=None, max_turns=8, on_status=None):
             # Execution policy: non-auto tools must be confirmed by user via natural language;
             # the LLM is instructed in the system prompt, so we trust its judgment here.
             # For tools that require the LLM to have asked first, the system prompt handles it.
-            # Execute on main thread:
+            # Execute on main thread using generalized executor pipeline:
             try:
-                tool_result = maya_utils.executeInMainThreadWithResult(_do)
+                from .agent_runtime.plan_executor import _call_tool_on_main_thread
+                tool_result = _call_tool_on_main_thread(canon_name, args)
             except ConfirmationError as ce:
                 confirm_payload = {
                     "type": "confirm",

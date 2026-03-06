@@ -1412,7 +1412,7 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
 
     def on_stop_execution(self):
         try:
-            from .core.agent_runtime import plan_executor
+            from ..core.agent_runtime import plan_executor
             plan_executor.cancel_execution()
             self.log(u"[系统] 正在停止作业...")
         except Exception as e:
@@ -1476,7 +1476,16 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
         t.start()
 
     def _on_status_update(self, status_text):
-        """Update the placeholder AI bubble text with current processing status."""
+        """Update the placeholder AI bubble text with current processing status.
+        Throttled to max once per 300ms to prevent UI freezing from rapid emit calls.
+        """
+        now = time.time()
+        if hasattr(self, '_last_status_time') and (now - self._last_status_time) < 0.3:
+            # Store latest text so it's not lost, but skip the UI update
+            self._pending_status = status_text
+            return
+        self._last_status_time = now
+        self._pending_status = None
         if self._ai_placeholder_item:
             widget = self.chatList.itemWidget(self._ai_placeholder_item)
             if widget:
@@ -1484,7 +1493,8 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
                 for label in widget.findChildren(QtWidgets.QLabel):
                     txt = label.text()
                     # Update the label that contains our status dots / prev status
-                    if any(kw in txt for kw in ["...", u"\u601d\u8003\u4e2d", u"\u6267\u884c\u4e2d", u"\u5468\u671f"]):
+                    if any(kw in txt for kw in ["...", u"\u601d\u8003\u4e2d", u"\u6267\u884c\u4e2d", u"\u5468\u671f",
+                                                 u"\u2699", u"\u2705", u"\u274c", u"\ud83e\udde0"]):
                         label.setText(status_text)
                         break
 

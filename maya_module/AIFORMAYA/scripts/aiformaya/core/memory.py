@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
 """
 AIFORMAYA v2.0 — Entity Memory (upgraded)
 Tracks: last_created, last_selected, last_camera, recent_objects
@@ -24,10 +25,15 @@ def _load_json(path):
         return {}
 
 
+import threading
+
+_MEMORY_LOCK = threading.Lock()
+
 def _save_json(path, data):
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with _MEMORY_LOCK:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -103,6 +109,16 @@ class EntityMemory(object):
         lst.append(name)
         if len(lst) > MAX_MEMORY_ENTITIES:
             data["recent_objects"] = lst[-MAX_MEMORY_ENTITIES:]
+
+    @classmethod
+    def get_last_created(cls):
+        data = cls.load()
+        return data.get("last_created", {})
+
+    @classmethod
+    def get_recent_objects(cls):
+        data = cls.load()
+        return data.get("recent_objects", [])
 
     # ── Summary for prompt injection ──
     @classmethod

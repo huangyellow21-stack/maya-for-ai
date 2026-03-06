@@ -22,6 +22,10 @@ except ImportError:
         @classmethod
         def update_last_created(cls, entity_type, entity_name):
             pass
+        @classmethod
+        def get_last_created(cls): return {}
+        @classmethod
+        def get_recent_objects(cls): return []
 
 
 class ToolError(Exception):
