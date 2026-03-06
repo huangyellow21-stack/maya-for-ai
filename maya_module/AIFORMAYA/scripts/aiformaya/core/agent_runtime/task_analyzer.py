@@ -35,6 +35,17 @@ _COMPLEXITY_SIGNALS = {
         u"一直看向", u"跟随", u"对准", u"绑定", u"约束", u"连接",
         "aim at", "follow", "track", "constrain", "attach",
     ],
+    # 展示/布光工作流信号 — 这类请求天然是多步骤
+    "presentation": [
+        u"展示", u"展示镜头", u"展示相机", u"布光", u"打光", u"三点布光", u"turntable",
+        u"作品展示", u"良品展示", u"产品展示",
+        "turntable", "presentation", "showcase", "lighting", "three-point", "three point",
+    ],
+    # FX / 爆炸信号 — 直接进入模板导入工作流
+    "fx": [
+        u"爆炸", u"炸弹", u"爆炸效果", u"爆炸特效", u"火焰爆炸", u"烟花爆炸",
+        "explosion", "bomb", "blast", "boom", "fx",
+    ],
 }
 
 def analyze_task(user_text):
@@ -58,7 +69,7 @@ def analyze_task(user_text):
 
     # 2a. 多动作动词检测
     action_verbs = re.findall(
-        u"(创建|做|生成|放|让|使|设置|添加|调整|删除|移动|旋转|滚动|弹跳|看向|对准)",
+        u"(创建|做|生成|放|让|使|设置|添加|调整|删除|移动|旋转|滚动|弹跳|看向|对准|布光|打光|展示)",
         text
     )
     if len(action_verbs) >= 2:
@@ -93,8 +104,14 @@ def analyze_task(user_text):
 
     # ── 4. 单独的动作关键词（兜底） ──
     action_kws = [u"滚", u"跳", u"转", u"围绕", u"绕", u"看向",
-                  u"对准", u"约束", u"碎", u"散布", u"铺满"]
-    if any(kw in text for kw in action_kws):
+                  u"对准", u"约束", u"碎", u"散布", u"铺满",
+                  # 高层工作流词 — 直接进复杂任务
+                  u"展示", u"布光", u"打光", u"turntable",
+                  "turntable", "showcase", "lighting",
+                  # FX 爆炸 — 必须与模板工作流
+                  u"爆炸", u"炸弹",
+                  "explosion", "bomb", "blast", "fx"]
+    if any(kw in text or kw in text.lower() for kw in action_kws):
         return "COMPLEX_TASK"
 
     return "SIMPLE_TOOL"

@@ -52,8 +52,9 @@ def resolve_capabilities(capabilities, targets, available_tools_schema):
         if tg in targets:
             creation_targets.append(tg)
     if not creation_targets:
-        # 对 FX / 爆炸类请求：不 fallback 到 sphere，交给上层 planner 处理
-        has_fx_intent = bool(_FX_TARGETS & set(str(t).lower() for t in targets))
+        # 双重 FX 保护：capability 级（最优先） + target 级（兜底）
+        has_fx_cap = "FX_EXPLOSION" in capabilities
+        has_fx_intent = has_fx_cap or bool(_FX_TARGETS & set(str(t).lower() for t in targets))
         if not has_fx_intent:
             creation_targets = ["sphere"]  # generic create-object default only
 

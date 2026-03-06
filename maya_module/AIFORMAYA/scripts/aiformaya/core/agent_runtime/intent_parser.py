@@ -103,6 +103,44 @@ class IntentParser(object):
         u"\u6e05\u7a7a": "delete",
 
         "delete": "delete",
+
+        # light / lighting
+        u"\u5e03\u5149": "light",
+        u"\u6253\u5149": "light",
+        u"\u7167\u4eae": "light",
+        u"\u4e09\u70b9\u5e03\u5149": "light",
+        u"\u4e3a.*\u6253\u5149": "light",
+
+        "light": "light",
+        "lighting": "light",
+        "illuminate": "light",
+
+        # presentation / turntable
+        u"\u5c55\u793a": "present",
+        u"\u5c55\u793a\u955c\u5934": "present",
+        u"\u5c55\u793a\u76f8\u673a": "present",
+        u"\u4e0d\u65ad\u65cb\u8f6c": "present",
+
+        "turntable": "present",
+        "presentation": "present",
+        "showcase": "present",
+        "display": "present",
+
+        # explosion / fx
+        u"\u7206\u70b8": "explode",
+        u"\u5f15\u7206": "explode",
+        u"\u70b8": "explode",
+        u"\u70b8\u5f00": "explode",
+        u"\u70b8\u5f39\u6548\u679c": "explode",
+        u"\u7206\u70b8\u6548\u679c": "explode",
+        u"\u7206\u70b8\u7279\u6548": "explode",
+
+        "explosion": "explode",
+        "explode": "explode",
+        "bomb": "explode",
+        "blast": "explode",
+        "boom": "explode",
+        "fx": "explode",
     }
 
     # ----------------------------
@@ -164,11 +202,49 @@ class IntentParser(object):
         u"\u7269\u4f53": "object",
         u"\u5bf9\u8c61": "object",
         u"\u4e1c\u897f": "object",
+        # model / asset (binds to current selection)
+        u"\u6a21\u578b": "object",
+        u"\u8fd9\u4e2a\u6a21\u578b": "object",
+        u"\u5f53\u524d\u6a21\u578b": "object",
+        u"\u7269\u4ef6": "object",
+        u"\u8d44\u4ea7": "object",
 
         "object": "object",
+        "model": "object",
+        "mesh": "object",
+        "asset": "object",
 
         u"\u76ee\u6807": "target",
         "target": "target",
+
+        # explosion / fx (high-level semantic objects)
+        u"\u7206\u70b8": "explosion",
+        u"\u70b8\u5f39": "bomb",
+        u"\u70b8\u5f39\u6548\u679c": "explosion",
+        u"\u7206\u70b8\u6548\u679c": "explosion",
+        u"\u7206\u70b8\u7279\u6548": "explosion",
+        u"\u706b\u7130\u7206\u70b8": "explosion",
+        u"\u70df\u82b1\u7206\u70b8": "explosion",
+        u"\u7279\u6548": "fx",
+
+        "explosion": "explosion",
+        "bomb": "bomb",
+        "blast": "explosion",
+        "boom": "explosion",
+        "fx": "fx",
+
+        # turntable camera (high-level semantic object)
+        u"turntable": "turntable",
+        u"\u5c55\u793a\u955c\u5934": "turntable",
+        u"\u5c55\u793a\u76f8\u673a": "turntable",
+        u"\u8f6c\u53f0": "turntable",
+        u"\u826f\u54c1\u5c55\u793a": "turntable",
+
+        # three-point lighting
+        u"\u4e09\u70b9\u5e03\u5149": "three_point_lighting",
+        u"\u4e09\u70b9\u5149": "three_point_lighting",
+        "three-point lighting": "three_point_lighting",
+        "three point lighting": "three_point_lighting",
     }
 
     # ----------------------------

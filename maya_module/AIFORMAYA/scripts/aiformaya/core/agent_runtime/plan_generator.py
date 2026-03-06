@@ -256,4 +256,41 @@ if target:
             }
             plan["steps"].append(step)
 
+        elif cap == "PRODUCT_TURNTABLE":
+            # Skip if ORBIT_ANIMATION already added a turntable
+            if "ORBIT_ANIMATION" in all_caps:
+                continue
+            turntable_tgt = subject_object or target_var or ""
+            step = {
+                "tool": "maya.create_turntable",
+                "args": {
+                    "target": turntable_tgt,
+                    "frames": 120,
+                },
+                "save_as": "turntable_cam_%d" % var_counter
+            }
+            plan["steps"].append(step)
+            camera_object = "turntable_cam_%d" % var_counter
+            var_counter += 1
+
+        elif cap == "FX_LIGHTING":
+            lighting_tgt = subject_object or target_var or ""
+            step = {
+                "tool": "maya.create_three_point_lighting",
+                "args": {
+                    "target": lighting_tgt,
+                    "intensity": 1.0,
+                }
+            }
+            plan["steps"].append(step)
+
+        elif cap == "FX_EXPLOSION":
+            step = {
+                "tool": "maya.import_bomb_asset",
+                "args": {
+                    "namespace": "Bomb",
+                }
+            }
+            plan["steps"].append(step)
+
     return plan

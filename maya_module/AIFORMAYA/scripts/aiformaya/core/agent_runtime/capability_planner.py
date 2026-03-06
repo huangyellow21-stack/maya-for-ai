@@ -21,6 +21,7 @@ def plan_capabilities(intent):
     count = intent.get("count", 1)
 
     # 1. Creation & Duplication
+    # Note: FX_EXPLOSION is checked later; if it fires, CREATE_OBJECT is suppressed
     if "create" in acts:
         capabilities.append("CREATE_OBJECT")
         if count > 1:
@@ -74,6 +75,20 @@ def plan_capabilities(intent):
     if "delete" in acts:
         capabilities.append("SCENE_CLEANUP")
 
+    # 8. High-level Presentation / FX Workflows
+    # Turntable / Product showcase
+    if "present" in acts or "turntable" in tgs:
+        capabilities.append("PRODUCT_TURNTABLE")
+
+    # Three-point lighting / FX lighting
+    if "light" in acts or "three_point_lighting" in tgs or "light" in tgs:
+        # Only if not a simple light-creation, i.e. it's about illuminating scene
+        capabilities.append("FX_LIGHTING")
+
+    # FX Explosion — always route to template; also fires from 'explode' action
+    if "explode" in acts or any(t in tgs for t in ("explosion", "bomb", "fx")):
+        capabilities.append("FX_EXPLOSION")
+
     # Deduplicate while preserving order
     seen = set()
     ordered_caps = []
@@ -81,5 +96,9 @@ def plan_capabilities(intent):
         if cap not in seen:
             ordered_caps.append(cap)
             seen.add(cap)
+
+    # FX conflict guard: if FX_EXPLOSION is present, remove CREATE_OBJECT (prevent sphere fallback)
+    if "FX_EXPLOSION" in ordered_caps and "CREATE_OBJECT" in ordered_caps:
+        ordered_caps = [c for c in ordered_caps if c != "CREATE_OBJECT"]
 
     return ordered_caps
