@@ -1121,6 +1121,86 @@ def tool_create_bouncing_ball(args):
     }
 
 
+def tool_add_bounce_animation(args):
+    """
+    对已存在的 target 物体设置 translateY 的弹跳关键帧动画。
+    不创建新球。若 ground_y 为空，则取当前 ty 为地面值。
+    """
+    target = args.get("target") or args.get("name")
+    if isinstance(target, basestring) and target.strip():
+        target = target.strip()
+        if not cmds.objExists(target):
+            raise ToolError("MAYA_INVALID_TARGET", "目标物体不存在：%s" % target)
+    else:
+        sel = _ensure_selection()
+        transforms = _to_transforms_from_selection(sel)
+        if len(transforms) != 1:
+            raise ToolError("AMBIGUOUS_TARGET", "需要唯一的 transform。请只选择一个，或明确提供 target。")
+        target = transforms[0]
+
+
+    start_time = float(args.get("start_time", 1))
+    end_time_arg = args.get("end_time")
+    duration = args.get("duration", 60)
+    if end_time_arg is not None:
+        end_time = float(end_time_arg)
+    else:
+        end_time = float(start_time + float(duration) - 1)
+    if end_time <= start_time:
+        raise ToolError("ARG_VALIDATION_FAILED", "end_time 必须 > start_time")
+        
+    bounces = int(args.get("bounces", 3))
+    if bounces < 1:
+        bounces = 1
+    height = float(args.get("height", 10.0))
+    decay = float(args.get("decay", 0.6))
+    
+    # 若为空取当前 ty
+    ground_y_arg = args.get("ground_y")
+    if ground_y_arg is not None:
+        ground_y = float(ground_y_arg)
+    else:
+        try:
+            ground_y = float(cmds.getAttr(target + ".ty"))
+        except Exception:
+            ground_y = 0.0
+
+    frames_total = end_time - start_time
+    segment = frames_total / float(bounces)
+
+    try:
+        cmds.cutKey(target, attribute="ty")
+    except Exception:
+        pass
+
+    keys = []
+    for i in range(bounces):
+        seg_start = start_time + segment * i
+        seg_end = seg_start + segment
+        peak_time = (seg_start + seg_end) * 0.5
+        amp = height * (decay ** i)
+        keys.append((seg_start, ground_y))
+        keys.append((peak_time, ground_y + amp))
+        keys.append((seg_end, ground_y))
+
+    for t, v in keys:
+        try:
+            cmds.setKeyframe(target, attribute="ty", time=t, value=v)
+        except Exception as e:
+            raise ToolError("MAYA_COMMAND_FAILED", "设置弹跳关键帧失败：%s" % str(e))
+
+    return {
+        "target": target,
+        "attribute": "translateY",
+        "start_time": start_time,
+        "end_time": end_time,
+        "bounces": bounces,
+        "height": height,
+        "decay": decay,
+        "ground_y": ground_y
+    }
+
+
 def tool_create_loop_rotate(args):
     target = args.get("target")
     if isinstance(target, basestring) and target.strip():
@@ -2759,6 +2839,25 @@ TOOLS = [
             "required": []
         },
         "handler": tool_create_bouncing_ball,
+    },
+    {
+        "name": "maya.add_bounce_animation",
+        "description": "对已存在的物体添加 translateY 弹跳动画。不会创建新球。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string"},
+                "start_time": {"type": "number"},
+                "end_time": {"type": "number"},
+                "duration": {"type": "number"},
+                "bounces": {"type": "integer", "minimum": 1, "default": 3},
+                "height": {"type": "number", "default": 10.0},
+                "decay": {"type": "number", "default": 0.6},
+                "ground_y": {"type": "number"}
+            },
+            "required": []
+        },
+        "handler": tool_add_bounce_animation,
     },
     {
         "name": "maya.copy_animation",

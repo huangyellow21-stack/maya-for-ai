@@ -62,6 +62,10 @@ TOOL_DESCRIPTIONS = """
   摄像机创建持久 aimConstraint 全程跟随 target（不删除约束）。
 
 ### 动画类（仅对已有物体添加动画，不会创建新物体）
+- maya.add_bounce_animation(target, start_time, end_time, bounces, height)
+  对【已有】物体做弹跳动画（translateY）。不会创建新物体。
+  target 必须是前面步骤创建的物体 name，或者忽略以作用于当前选择。
+
 - maya.create_and_animate_translate_x(target, start_value, end_value, start_time, end_time)
   对【已有】物体做 X 轴平移动画。target 必须是前面步骤创建的物体 name。
 
@@ -201,7 +205,7 @@ def build_planning_prompt(user_text, scene_context="", tool_descriptions=None):
 camera_look_at 的 camera 和 target 必须与创建时的 name 完全一致
 参数要具体：不要留空，每个数值都要算好
 
-不要重复创建：如果已经用 create_sphere 创建了球，就不要再用 create_bouncing_ball
+不要重复创建：如果已经用 create_sphere 创建了球，就不要再用 create_bouncing_ball，如有弹跳需求请使用 add_bounce_animation
 
 输出格式（严格 JSON）：
 ```json
@@ -433,6 +437,7 @@ _TOOL_TO_HUMAN = {
     "maya.create_loop_rotate":             u"添加循环旋转动画",
     "maya.create_ping_pong_translate":     u"添加往复平移动画",
     "maya.create_and_animate_translate_x": u"添加X轴平移动画",
+    "maya.add_bounce_animation":           u"添加弹跳动画",
     "maya.create_bouncing_ball":           u"创建弹跳球动画",
     "maya.create_turntable":               u"创建展示转台摄像机",
     "maya.set_key":                        u"设置关键帧",
@@ -455,10 +460,10 @@ _CREATE_TOOLS = {
 }
 _MODIFY_TOOLS = {
     "maya.create_loop_rotate", "maya.create_ping_pong_translate",
-    "maya.create_and_animate_translate_x", "maya.camera_look_at",
-    "maya.camera_frame_selection", "maya.set_key", "maya.retime_keys",
-    "maya.retime_range", "maya.freeze_transforms", "maya.center_pivot",
-    "maya.duplicate_objects",
+    "maya.create_and_animate_translate_x", "maya.add_bounce_animation",
+    "maya.camera_look_at", "maya.camera_frame_selection", "maya.set_key",
+    "maya.retime_keys", "maya.retime_range", "maya.freeze_transforms",
+    "maya.center_pivot", "maya.duplicate_objects",
 }
 _DELETE_TOOLS = {"maya.delete_selected", "maya.cleanup_scene"}
 _HIGH_RISK_KEYWORDS = {"delete", "cleanup", "remove", "del"}

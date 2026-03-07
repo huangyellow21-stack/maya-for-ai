@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 from .spatial_reasoning import calculate_spatial_offsets
 
+def _fmt_target(t, plan_vars):
+    if not t: return ""
+    return "{%s}" % t if (t in plan_vars or t.startswith("{")) else t
+
 def generate_plan(intent, resolved_tools, scene_context, semantic):
     """
     Translates ordered resolved tools + intent + context + semantic objects into the final Plan JSON 
@@ -10,6 +14,7 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
     plan = {
         "steps": []
     }
+    plan_vars = set()
     
     act_count = intent.get("count", 1)
     relations = intent.get("relations", [])
@@ -76,6 +81,7 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
                 "save_as": current_var
             }
             plan["steps"].append(step)
+            plan_vars.add(current_var)
             
             # Categorize the created object
             if obj_type == "plane":
@@ -111,6 +117,7 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
                 "save_as": copies_var
             }
             plan["steps"].append(step)
+            plan_vars.add(copies_var)
             var_counter += 1
 
         elif cap in ["SCATTER_AROUND", "PLACE_ON_TOP", "PLACE_NEXT_TO", "RANDOM_SCATTER"]:
@@ -160,34 +167,48 @@ def generate_plan(intent, resolved_tools, scene_context, semantic):
             plan["steps"].append(step)
 
         elif cap == "BOUNCE_ANIMATION":
-            bounce_var = "bounce_%d" % var_counter
-            step = {
-                "tool": "maya.create_bouncing_ball",
-                "args": {"name": bounce_var},
-                "save_as": bounce_var
-            }
-            plan["steps"].append(step)
-            subject_object = bounce_var
-            var_counter += 1
+            target = subject_object or target_var
+            if target:
+                step = {
+                    "tool": "maya.add_bounce_animation",
+                    "args": {"target": _fmt_target(target, plan_vars)}
+                }
+                plan["steps"].append(step)
+            else:
+                bounce_var = "bounce_%d" % var_counter
+                step = {
+                    "tool": "maya.create_bouncing_ball",
+                    "args": {"name": bounce_var},
+                    "save_as": bounce_var
+                }
+                plan["steps"].append(step)
+                plan_vars.add(bounce_var)
+                subject_object = bounce_var
+                var_counter += 1
 
         elif cap == "ROTATE_ANIMATION":
+            target = subject_object or target_var
+            args = {}
+            if target:
+                args["target"] = _fmt_target(target, plan_vars)
             step = {
                 "tool": "maya.create_loop_rotate",
-                "args": {"target": "{%s}" % (subject_object if subject_object else "selection")}
+                "args": args
             }
             plan["steps"].append(step)
 
         elif cap == "ORBIT_ANIMATION":
             orbit_target = subject_object or target_var or ""
+            args = {"frames": 120}
+            if orbit_target:
+                args["target"] = _fmt_target(orbit_target, plan_vars)
             step = {
                 "tool": "maya.create_turntable",
-                "args": {
-                    "target": orbit_target if orbit_target and not orbit_target.startswith("{") else "{%s}" % (subject_object or "selection"),
-                    "frames": 120
-                },
+                "args": args,
                 "save_as": "turntable_cam_%d" % var_counter
             }
             plan["steps"].append(step)
+            plan_vars.add("turntable_cam_%d" % var_counter)
             camera_object = "turntable_cam_%d" % var_counter
             var_counter += 1
 
@@ -240,12 +261,17 @@ if target:
             if "ORBIT_ANIMATION" in all_caps:
                 continue
             
+            args = {}
+            if camera_object:
+                args["camera"] = _fmt_target(camera_object, plan_vars)
+            
+            target = subject_object or target_var
+            if target:
+                args["target"] = _fmt_target(target, plan_vars)
+                
             step = {
                 "tool": "maya.camera_look_at",
-                "args": {
-                    "camera": "{%s}" % (camera_object if camera_object else "camera"),
-                    "target": subject_object if subject_object else target_var
-                }
+                "args": args
             }
             plan["steps"].append(step)
 
@@ -270,6 +296,7 @@ if target:
                 "save_as": "turntable_cam_%d" % var_counter
             }
             plan["steps"].append(step)
+            plan_vars.add("turntable_cam_%d" % var_counter)
             camera_object = "turntable_cam_%d" % var_counter
             var_counter += 1
 
