@@ -35,6 +35,16 @@ except Exception:
     QtWidgets = None
     shiboken2 = None
 
+try:
+    unicode_type = unicode
+except NameError:
+    unicode_type = str
+
+try:
+    long_type = long
+except NameError:
+    long_type = int
+
 
 def _kill_process_by_port(port):
     """
@@ -187,6 +197,7 @@ class AiformayaWidget(QtWidgets.QWidget):
         self.signals.chat_finished.connect(self.on_chat_finished)
         self.signals.chat_error.connect(self.on_chat_error)
         self.signals.gateway_status.connect(self.on_gateway_status)
+        self.signals.status_update.connect(self._on_status_update)
 
         self._ai_placeholder_item = None
         self._gateway_running = False
@@ -249,13 +260,18 @@ class AiformayaWidget(QtWidgets.QWidget):
         return candidates[0]
 
     def _to_unicode(self, value):
-        if isinstance(value, unicode):
+        if isinstance(value, unicode_type):
             return value
-        enc = sys.getfilesystemencoding() or "mbcs"
+        if isinstance(value, bytes):
+            enc = sys.getfilesystemencoding() or "mbcs"
+            try:
+                return value.decode(enc)
+            except Exception:
+                return value.decode("utf-8", errors="ignore")
         try:
-            return value.decode(enc)
+            return unicode_type(value)
         except Exception:
-            return unicode(value, errors="ignore")
+            return str(value)
 
     def _normalize_icon_name(self, name):
         text = self._to_unicode(name).replace(" ", "").replace(u"（", "(").replace(u"）", ")")
@@ -779,28 +795,28 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
             display_text = re.sub(r'<think>[\s\S]*?</think>', '', display_text).strip()
             
         if role == "user":
-            if display_text.startswith("你："):
+            if display_text.startswith(u"你："):
                 display_text = display_text[2:].strip()
             # Remove any leading diamond or weird symbols sometimes sent by error
-            for prefix in ["：", ": ", "❖：", "❖: "]:
+            for prefix in [u"：", u": ", u"❖：", u"❖: "]:
                 if display_text.startswith(prefix):
                     display_text = display_text[len(prefix):].strip()
                     break
-            display_text = "<b>你：</b><br>" + display_text
+            display_text = u"<b>你：</b><br>" + display_text
         elif role == "ai":
-            if display_text.startswith("AI："):
-                 display_text = display_text[len("AI："):].strip()
-            display_text = "<b>AI：</b><br>" + display_text
+            if display_text.startswith(u"AI："):
+                 display_text = display_text[len(u"AI："):].strip()
+            display_text = u"<b>AI：</b><br>" + display_text
         else:
-            if display_text.startswith("系统："):
-                 display_text = display_text[len("系统："):].strip()
-            elif display_text.startswith("[系统]"):
-                 display_text = display_text[len("[系统]"):].strip()
-            display_text = "<b>系统提示：</b><br>" + display_text
+            if display_text.startswith(u"系统："):
+                 display_text = display_text[len(u"系统："):].strip()
+            elif display_text.startswith(u"[系统]"):
+                 display_text = display_text[len(u"[系统]"):].strip()
+            display_text = u"<b>系统提示：</b><br>" + display_text
 
         # Format Markdown trivially to rich text
-        display_text = display_text.replace("\n", "<br>")
-        display_text = display_text.replace("```python", "<br><i>[Python Code]</i><br><code>").replace("```", "</code><br>")
+        display_text = display_text.replace(u"\n", u"<br>")
+        display_text = display_text.replace(u"```python", u"<br><i>[Python Code]</i><br><code>").replace(u"```", u"</code><br>")
         
         widget = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(widget)
@@ -861,15 +877,15 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
             except Exception:
                 pass
 
-        if text.startswith("你："):
+        if text.startswith(u"你："):
             role = "user"
-            content = text[len("你："):].strip()
-        elif text.startswith("AI："):
+            content = text[len(u"你："):].strip()
+        elif text.startswith(u"AI："):
             role = "ai"
-            content = text[len("AI："):].strip()
+            content = text[len(u"AI："):].strip()
         
         # Check for weird icon artifacts
-        for prefix in ["：", "❖："]:
+        for prefix in [u"：", u"❖："]:
             if content.startswith(prefix):
                  content = content[len(prefix):].strip()
                  break
@@ -1209,7 +1225,7 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
             self.startGatewayBtn.setVisible(False)
             self.restartGatewayBtn.setVisible(True)
             if prev_status != "Connected":
-                 self.log("[系统] 网关连接成功。")
+                 self.log(u"[系统] 网关连接成功。")
         else:
             self._gateway_running = False
             self.restartGatewayBtn.setVisible(False)
@@ -1346,9 +1362,9 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
             # server 是在前台运行的，所以 bat 也是一直运行的，这没问题。
             # 问题是如果 server 启动失败，bat 会 pause，导致 python 进程不退出。
             
-            # 使用 PIPE 捕获输出，以便分析错误
+            # 使用 shell=True 时，Windows 上传入列表可能存在解析风险，直接传入字符串
             proc = subprocess.Popen(
-                [bat_path], 
+                bat_path, 
                 cwd=work_dir, 
                 shell=True, 
                 startupinfo=startupinfo, 
@@ -1368,14 +1384,20 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
                 if proc.poll() is not None:
                     # 读取错误输出
                     try:
-                        _, stderr_data = proc.communicate()
-                        err_msg = stderr_data.decode("mbcs", "ignore") if stderr_data else "Process exited unexpectedly"
+                        out_data, err_data = proc.communicate()
+                        err_msg = ""
+                        if err_data:
+                            err_msg += err_data.decode("mbcs", "ignore")
+                        if out_data:
+                            err_msg += "\n" + out_data.decode("mbcs", "ignore")
+                        if not err_msg.strip():
+                            err_msg = "Process exited unexpectedly"
                     except:
                         err_msg = "Process exited unexpectedly"
                     
                     self.signals.gateway_status.emit("Disconnected: Startup Failed", "color: #FF5252;")
                     # 记录详细日志到聊天窗口，帮助排查
-                    self.signals.chat_error.emit("网关启动失败，错误日志：\n" + err_msg)
+                    self.signals.chat_error.emit(u"网关启动失败，错误日志：\n" + err_msg)
                     return
 
                 # 2. 正常健康检查
@@ -1392,9 +1414,21 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
                     pass
 
             self.signals.gateway_status.emit("Disconnected: Timeout", "color: #FF5252;")
-            # 超时后尝试杀掉进程，避免僵尸
-            try: proc.kill() 
-            except: pass
+            # 超时后尝试杀掉进程，避免僵尸并读取日志
+            try:
+                proc.kill()
+                out_data, err_data = proc.communicate(timeout=2)
+                err_msg = ""
+                if err_data:
+                    err_msg += err_data.decode("mbcs", "ignore")
+                if out_data:
+                    err_msg += "\n" + out_data.decode("mbcs", "ignore")
+                if err_msg.strip():
+                    self.signals.chat_error.emit(u"网关启动超时，最后输出日志：\n" + err_msg.strip())
+                else:
+                    self.signals.chat_error.emit(u"网关启动超时，未获取到任何错误日志，请检查环境。")
+            except Exception:
+                pass
             
         except Exception as e:
             self.signals.gateway_status.emit("Disconnected: %s" % str(e), "color: #FF5252;")
@@ -1474,8 +1508,6 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
         import copy
         history_copy = copy.deepcopy(self.history)
 
-        self.signals.status_update.connect(self._on_status_update)
-
         t = threading.Thread(target=functools.partial(self._chat_thread_func, text, history_copy))
         t.daemon = True
         t.start()
@@ -1495,9 +1527,21 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
         if hasattr(self, '_last_status_time') and (now - self._last_status_time) < 0.3:
             # Store latest text so it's not lost, but skip the UI update
             self._pending_status = status_text
+            # Schedule a delayed flush if no other status comes in
+            QtCore.QTimer.singleShot(350, self._flush_pending_status)
             return
+
         self._last_status_time = now
         self._pending_status = None
+        self._render_status(status_text)
+        
+    def _flush_pending_status(self):
+        if hasattr(self, '_pending_status') and self._pending_status:
+            status = self._pending_status
+            self._pending_status = None
+            self._render_status(status)
+            
+    def _render_status(self, status_text):
         if self._ai_placeholder_item:
             widget = self.chatList.itemWidget(self._ai_placeholder_item)
             if widget:
@@ -1562,9 +1606,9 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
                 plan_data = reply.get("plan", {})
                 self._add_plan_card(plan_data)
             else:
-                self._add_chat_bubble("ai", str(reply))
+                self._add_chat_bubble("ai", reply if isinstance(reply, (str, unicode_type)) else repr(reply))
         else:
-            self._add_chat_bubble("ai", str(reply))
+            self._add_chat_bubble("ai", reply if isinstance(reply, (str, unicode_type)) else repr(reply))
 
         self.chatList.scrollToBottom()
 
@@ -1847,6 +1891,8 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
 
     def on_chat_error(self, error):
         self.sendBtn.setEnabled(True)
+        self.sendBtn.setVisible(True)
+        self.stopBtn.setVisible(False)
         self.input.setEnabled(True)
         self.input.setFocus()
 
@@ -1855,7 +1901,7 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
             self.chatList.takeItem(row)
             self._ai_placeholder_item = None
             
-        self._add_error_card(str(error))
+        self._add_error_card(error if isinstance(error, (str, unicode_type)) else repr(error))
         self.chatList.scrollToBottom()
 
     def _is_maya_related(self, text):
@@ -1874,16 +1920,16 @@ QFrame#EditModeBanner { background-color: #2A1F00; border: 1px solid #FF9800; bo
             "timeline",
             "constraint",
             "anim",
-            "动画",
-            "场景",
-            "模型",
-            "物体",
-            "节点",
-            "关键帧",
-            "摄像机",
-            "镜头",
-            "骨骼",
-            "约束",
+            u"动画",
+            u"场景",
+            u"模型",
+            u"物体",
+            u"节点",
+            u"关键帧",
+            u"摄像机",
+            u"镜头",
+            u"骨骼",
+            u"约束",
             "particle",
             "fx",
             "vfx",
@@ -1914,7 +1960,7 @@ def _maya_main_window():
         ptr = omui.MQtUtil.mainWindow()
         if ptr is None:
             return None
-        return shiboken2.wrapInstance(long(ptr), QtWidgets.QWidget)
+        return shiboken2.wrapInstance(long_type(ptr), QtWidgets.QWidget)
     except Exception:
         return None
 
@@ -1938,7 +1984,7 @@ def show():
         ptr = omui.MQtUtil.findMenuItem(CONTROL_NAME)
     if ptr is None:
         raise RuntimeError("无法获取 workspaceControl 的 Qt 指针：%s" % CONTROL_NAME)
-    qt_parent = shiboken2.wrapInstance(long(ptr), QtWidgets.QWidget)
+    qt_parent = shiboken2.wrapInstance(long_type(ptr), QtWidgets.QWidget)
 
     # Ensure a layout exists and add our widget
     lay = qt_parent.layout()

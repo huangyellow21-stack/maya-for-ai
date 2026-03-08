@@ -7,6 +7,7 @@ Tracks: last_created, last_selected, last_camera, recent_objects
 import os
 import json
 import time
+import io
 
 MEMORY_FILE = os.path.expanduser("~/.aiformaya_memory.json")
 CHAT_FILE = os.path.expanduser("~/.aiformaya_chat.json")
@@ -19,7 +20,7 @@ def _load_json(path):
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with io.open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -32,7 +33,7 @@ _MEMORY_LOCK = threading.Lock()
 def _save_json(path, data):
     try:
         with _MEMORY_LOCK:
-            with open(path, "w", encoding="utf-8") as f:
+            with io.open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass

@@ -29,6 +29,8 @@ CAPABILITY_TOOL_MAP = {
     "ROLL_ANIMATION":     ["maya.create_loop_rotate", "maya.execute_python_code"],
     "SURFACE_ATTACH":     ["maya.execute_python_code"],
     "FOLLOW_CAMERA":      ["maya.camera_look_at", "maya.execute_python_code"],
+    "CAMERA_LOOK":        ["maya.camera_look_at", "maya.execute_python_code"],
+    "RANDOM_SCATTER":     ["maya.execute_python_code", "maya.duplicate_objects"],
     # FX 特效 — 始终优先模板，绝不降级为普通球体或 execute_python_code
     "FX_EXPLOSION":       ["maya.import_bomb_asset"],
     "FX_LIGHTING":        ["maya.create_three_point_lighting", "maya.execute_python_code"],

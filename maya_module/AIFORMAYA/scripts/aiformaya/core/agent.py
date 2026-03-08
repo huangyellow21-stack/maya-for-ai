@@ -395,7 +395,7 @@ def _base_prompt(role_desc, scene_ctx, mem_summary, tool_list=None):
         prompt += u"\n\n" + mem_summary
     return prompt
 
-_NARRATION_RULES = """
+_NARRATION_RULES = u"""
 ## 回复规则
 
 当工具执行完毕后，你需要用自然语言总结结果。遵循以下原则：
